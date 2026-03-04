@@ -1,0 +1,21 @@
+NodeNumber = 5
+ContainerNumber = 8
+ServiceNumber = 8
+ResourceNumber = 2
+lambda1 = 0
+lambda2 = -100
+lambda3 = 100
+lambda4 = 10
+# Define other parameters and hyperparameters
+epsilon = 1  # epsilon-greedy parameter
+learning_rate = 0.001
+max_episode = 10000
+det = 0.01
+gamma = 0.9
+target_update_frequency = 50
+zeta = 1e-28
+precision = 1e-7
+replyBuffer_size = 100
+batch_size = 50
+plot_frequency = 25
+epsilon_decrement = 1e-4
