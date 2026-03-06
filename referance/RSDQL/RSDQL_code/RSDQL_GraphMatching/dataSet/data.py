@@ -3,77 +3,93 @@
 import xml.dom.minidom
 from xml.etree import ElementTree as ET
 
-CPUnum = 7
-Mem = 8 * 1024
+def _get_element_text(elem, *names, default=0):
+    for name in names:
+        child = elem.find(name)
+        if child is not None and child.text:
+            return float(child.text)
+    return default
 
 class Data:
-    def __init__(self, xml_path='./dataSet/data.xml'):
+    def __init__(self, xml_path='data.xml'):
         self.xml_path = xml_path
         self._load_data()
         
     def _load_data(self):
-        dom1 = xml.dom.minidom.parse(self.xml_path)
-        root = dom1.documentElement
-        dom2 = ET.parse(self.xml_path)
-        
-        self.NodeNumber = int(root.getElementsByTagName('nodeNumber')[0].firstChild.data)
-        self.ContainerNumber = int(root.getElementsByTagName('containerNumber')[0].firstChild.data)
-        self.ServiceNumber = int(root.getElementsByTagName('serviceNumber')[0].firstChild.data)
-        self.ResourceType = int(root.getElementsByTagName('resourceType')[0].firstChild.data)
-        
-        self.service_containernum = []
-        self.service_container = []
-        self.service_container_relationship = []
-        self.container_state_queue = []
-        
-        for oneper in dom2.findall('./number/containerNumber'):
-            for child in oneper:
-                self.service_container_relationship.append(int(child.text))
-                
-        for oneper in dom2.findall('./number/serviceNumber'):
-            for child in oneper:
-                self.service_containernum.append(int(child.text))
-                self.service_container.append([int(child[0].text)])
-                self.container_state_queue.append(-1)
-                self.container_state_queue.append(int(child[0][0].text) / CPUnum)
-                self.container_state_queue.append(int(child[0][1].text) / Mem)
-        
-        Dist_temp = []
-        for oneper in dom2.findall('./distance'):
-            for child in oneper:
-                Dist_temp.append(float(child.text))
-        self.Dist = [Dist_temp[i:i + self.NodeNumber] for i in range(0, len(Dist_temp), self.NodeNumber)]
-        
-        weight_temp = []
-        for oneper in dom2.findall('./weight'):
-            for child in oneper:
-                weight_temp.append(float(child.text))
-        self.service_weight = [weight_temp[i:i + self.ServiceNumber] for i in range(0, len(weight_temp), self.ServiceNumber)]
-        
-        self.node_resources = self._extract_node_resources()
-        self.node_distances = self.Dist
-        
-    def _extract_node_resources(self):
-        resources = []
-        for i in range(self.NodeNumber):
-            resources.append({
-                'cpu': 1.0,
-                'memory': 1.0,
-                'bandwidth': 1.0
-            })
-        return resources
+        tree = ET.parse(self.xml_path)
+        root = tree.getroot()
+
+        self.uav_nodes = {}
+        self.service_nodes = {}
+        self.uav_edges = []
+        self.service_edges = []
+
+        uavnode = root.find('uavnode')
+        for node_elem in uavnode.find('nodeNumber'):
+            node_id = int(node_elem.find('Id').text)
+            cpu = float(node_elem.find('CPU').text)
+            memory = float(node_elem.find('Memory').text)
+            self.uav_nodes[node_id] = UAV(node_id, cpu, memory)
+
+        nodeEdge = uavnode.find('nodeEdge')
+        if nodeEdge is not None:
+            for edge_elem in nodeEdge:
+                src = int(edge_elem.find('src').text)
+                dst = int(edge_elem.find('dst').text)
+                bandwidth = _get_element_text(edge_elem, 'bandwith', 'bandwidth', default=100)
+                latency = _get_element_text(edge_elem, 'lantency', 'latency', default=10)
+                self.uav_nodes[src].add_src_edge(src, dst, bandwidth, latency)
+                self.uav_nodes[dst].add_dst_edge(src, dst, bandwidth, latency)
+                self.uav_edges.append(Edge(src, dst, bandwidth, latency))
+
+        servicenode = root.find('servicenode')
+        for node_elem in servicenode.find('nodeNumber'):
+            node_id = int(node_elem.find('Id').text)
+            cpu_demand = float(node_elem.find('CPU').text)
+            memory_demand = float(node_elem.find('Memory').text)
+            self.service_nodes[node_id] = Service(node_id, cpu_demand, memory_demand)
+
+        nodeEdge = servicenode.find('nodeEdge')
+        if nodeEdge is not None:
+            for edge_elem in nodeEdge:
+                src = int(edge_elem.find('src').text)
+                dst = int(edge_elem.find('dst').text)
+                bandwidth = _get_element_text(edge_elem, 'bandwith', 'bandwidth', default=100)
+                latency = _get_element_text(edge_elem, 'lantency', 'latency', default=10)
+                self.service_nodes[src].add_src_edge(src, dst, bandwidth, latency)
+                self.service_nodes[dst].add_dependencies(src, dst, bandwidth, latency)
+                self.service_edges.append(Edge(src, dst, bandwidth, latency))
 
 
-class Node:
-    def __init__(self, node_id, cpu, memory, bandwidth=1.0):
+class UAV:
+    def __init__(self, node_id, cpu, memory):
         self.id = node_id
-        self.cpu = cpu
-        self.memory = memory
-        self.bandwidth = bandwidth
+        self.total_cpu = cpu
+        self.total_memory = memory
+        self.remain_cpu = cpu
+        self.remain_memory = memory
+        self.src_edges = []
+        self.dst_edges = []
         self.services = []
-        
+
+    def add_src_edge(self, src, dst, bandwidth, latency):
+        self.src_edges.append({
+            'src': src,
+            'dst': dst,
+            'bandwidth': bandwidth,
+            'latency': latency
+        })
+
+    def add_dst_edge(self, src, dst, bandwidth, latency):
+        self.dst_edges.append({
+            'src': src,
+            'dst': dst,
+            'bandwidth': bandwidth,
+            'latency': latency
+        })
+
     def __repr__(self):
-        return f"Node(id={self.id}, cpu={self.cpu:.2f}, mem={self.memory:.2f})"
+        return f"UAV(id={self.id}, total_cpu={self.total_cpu:.2f}, total_mem={self.total_memory:.2f}, remain_cpu={self.remain_cpu:.2f}, remain_mem={self.remain_memory:.2f}, src_edges={self.src_edges}, dst_edges={self.dst_edges}, service={self.services})"
 
 
 class Service:
@@ -81,24 +97,59 @@ class Service:
         self.id = service_id
         self.cpu_demand = cpu_demand
         self.memory_demand = memory_demand
+        self.src_edges = []
         self.dependencies = []
-        
-    def add_dependency(self, other_service, weight=1.0):
-        self.dependencies.append({
-            'service': other_service,
-            'weight': weight
+        self.node = 0
+
+    def add_src_edge(self, src, dst, bandwidth, latency):
+        self.src_edges.append({
+            'src': src,
+            'dst': dst,
+            'bandwidth': bandwidth,
+            'latency': latency
         })
-        
+
+    def add_dependencies(self, src, dst, bandwidth, latency):
+        self.dependencies.append({
+            'src': src,
+            'dst': dst,
+            'bandwidth': bandwidth,
+            'latency': latency
+        })
+
     def __repr__(self):
-        return f"Service(id={self.id}, cpu={self.cpu_demand:.2f}, mem={self.memory_demand:.2f})"
+        return f"Service(id={self.id}, cpu={self.cpu_demand:.2f}, mem={self.memory_demand:.2f}, src_edges={self.src_edges}, dependencies={self.dependencies}, node={self.node})"
 
 
 class Edge:
-    def __init__(self, src, dst, weight=1.0, latency=0.0):
+    def __init__(self, src, dst, bandwidth, latency):
         self.src = src
         self.dst = dst
-        self.weight = weight
+        self.bandwidth = bandwidth
         self.latency = latency
-        
+
     def __repr__(self):
-        return f"Edge({self.src}->{self.dst}, weight={self.weight:.2f})"
+        return f"Edge({self.src}->{self.dst}, bandwidth={self.bandwidth:.2f}, latency={self.latency:.2f})"
+
+
+def test_data_loading():
+    data = Data('data.xml')
+
+    print("=== UAV Nodes ===")
+    for node_id, node in data.uav_nodes.items():
+        print(node)
+
+    print("\n=== Service Nodes ===")
+    for service_id, service in data.service_nodes.items():
+        print(service)
+
+    print("\n=== UAV Edges ===")
+    for edge in data.uav_edges:
+        print(f"  {edge.src} -> {edge.dst}: bw={edge.bandwidth:.2f}, lat={edge.latency:.2f}")
+
+    print("\n=== Service Edges ===")
+    for edge in data.service_edges:
+        print(f"  {edge.src} -> {edge.dst}: bw={edge.bandwidth:.2f}, lat={edge.latency:.2f}")
+
+if __name__ == "__main__":
+    test_data_loading()

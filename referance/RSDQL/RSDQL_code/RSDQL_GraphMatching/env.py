@@ -15,14 +15,18 @@ class Env:
         self.task_graph_generator = TaskGraphGenerator(self.data)
         self.task_graph = self.task_graph_generator.generate_initial_graph()
         self.matcher = GraphMatcher(self.resource_graph, self.task_graph)
-        self.feedback_optimizer = FeedbackOptimizer(self.task_graph)
+        self.feedback_optimizer = FeedbackOptimizer(self.task_graph, self.resource_graph)
         
         self.state = None
         self.current_mapping = None
         self.episode_count = 0
+        self.iteration_count = 0
+        self.max_iterations = 20
+        self.convergence_threshold = 0.05
         
     def reset(self):
         self.episode_count += 1
+        self.iteration_count = 0
         self.matcher = GraphMatcher(self.resource_graph, self.task_graph)
         self.current_mapping = self.matcher.match(method='hungarian')
         
@@ -42,7 +46,9 @@ class Env:
             'communication_matrix': self.task_graph.communication_matrix,
             'distance_matrix': self.resource_graph.distance_matrix,
             'mapping': self.current_mapping,
-            'match_score': self.matcher.match_score
+            'match_score': self.matcher.match_score,
+            'task_topology_stats': self.task_graph.get_topology_stats(),
+            'iteration': self.iteration_count
         }
         
         return state
@@ -63,9 +69,12 @@ class Env:
         
         feedback = self.feedback_optimizer.generate_feedback()
         
-        if feedback.get('adjustment_type') != 'none':
-            self.task_graph = self.feedback_optimizer.adjust_task_graph(feedback)
-            self.matcher = GraphMatcher(self.resource_graph, self.task_graph)
+        if feedback.get('adjustment_type') != 'none' and not feedback.get('convergence', False):
+            if self.iteration_count < self.max_iterations:
+                self.task_graph = self.feedback_optimizer.adjust_task_graph(feedback)
+                self.matcher = GraphMatcher(self.resource_graph, self.task_graph)
+                self.current_mapping = self.matcher.match(method='hungarian')
+                self.iteration_count += 1
         
         done = True
         
@@ -76,7 +85,9 @@ class Env:
             'var_cost': var_cost,
             'metrics': metrics,
             'feedback': feedback,
-            'deployment_plan': deployment_plan
+            'deployment_plan': deployment_plan,
+            'iteration': self.iteration_count,
+            'converged': feedback.get('convergence', False)
         }
         
         self.state = self._build_state()
@@ -94,7 +105,8 @@ class Env:
                         node1 = service1['node_id']
                         node2 = service2['node_id']
                         distance = self.resource_graph.get_shortest_path_distance(node1, node2)
-                        comm_cost += weight * distance
+                        if distance < float('inf'):
+                            comm_cost += weight * distance
                         
         comm_cost = comm_cost / 2.0
         
@@ -117,8 +129,8 @@ class Env:
         cpu_loads = [load['cpu'] for load in node_loads.values()]
         mem_loads = [load['memory'] for load in node_loads.values()]
         
-        cpu_var = np.var(cpu_loads) if cpu_loads else 0
-        mem_var = np.var(mem_loads) if mem_loads else 0
+        cpu_var = np.var(cpu_loads) if len(cpu_loads) > 1 else 0
+        mem_var = np.var(mem_loads) if len(mem_loads) > 1 else 0
         
         return cpu_var + mem_var
         
@@ -132,10 +144,22 @@ class Env:
         return reward
         
     def _simulate_deployment_metrics(self, deployment_plan):
-        success_rate = 1.0
+        match_score = self.matcher.match_score
+        
+        success_rate = match_score
+        
+        if match_score < 0.5:
+            success_rate = match_score * 0.8
+        elif match_score < 0.7:
+            success_rate = match_score * 0.9
+        else:
+            success_rate = 0.85 + match_score * 0.15
+            
+        success_rate = min(1.0, success_rate)
         
         total_distance = 0
         edge_count = 0
+        latency_samples = []
         
         for i in range(len(deployment_plan)):
             for j in range(len(deployment_plan)):
@@ -144,32 +168,123 @@ class Env:
                     node_i = deployment_plan[i]['node_id']
                     node_j = deployment_plan[j]['node_id']
                     distance = self.resource_graph.get_shortest_path_distance(node_i, node_j)
-                    total_distance += distance
-                    edge_count += 1
+                    if distance < float('inf'):
+                        total_distance += distance
+                        latency_samples.append(distance * 10)
+                        edge_count += 1
                     
         avg_distance = total_distance / edge_count if edge_count > 0 else 0
         avg_latency = avg_distance * 10
         
+        latency_variance = np.var(latency_samples) if len(latency_samples) > 1 else 0
+        
         reschedule_count = 0
-        if self.matcher.match_score < 0.7:
-            reschedule_count = int((1 - self.matcher.match_score) * 10)
+        if match_score < 0.7:
+            reschedule_count = int((1 - match_score) * 10)
+        if match_score < 0.5:
+            reschedule_count += 3
             
         node_resources = self.resource_graph.get_node_resource_capacity()
-        used_resources = 0
+        used_resources = {'cpu': 0, 'memory': 0}
+        
+        node_loads = {}
+        for plan in deployment_plan:
+            node_id = plan['node_id']
+            if node_id not in node_loads:
+                node_loads[node_id] = {'cpu': 0, 'memory': 0}
+            node_loads[node_id]['cpu'] += plan['cpu_demand']
+            node_loads[node_id]['memory'] += plan['memory_demand']
+            used_resources['cpu'] += plan['cpu_demand']
+            used_resources['memory'] += plan['memory_demand']
+            
+        total_capacity = sum(n['cpu'] + n['memory'] for n in node_resources) if node_resources else 1
+        resource_utilization = (used_resources['cpu'] + used_resources['memory']) / total_capacity if total_capacity > 0 else 0
+        
+        cpu_loads = [l['cpu'] for l in node_loads.values()]
+        mem_loads = [l['memory'] for l in node_loads.values()]
+        
+        if cpu_loads and mem_loads:
+            total_load = [cpu_loads[i] + mem_loads[i] for i in range(len(cpu_loads))]
+            if len(total_load) > 1:
+                load_balance_score = 1.0 - min(1.0, np.std(total_load) / (np.mean(total_load) + 0.001))
+            else:
+                load_balance_score = 1.0
+        else:
+            load_balance_score = 0.0
+            
+        network_load = total_distance / max(1, edge_count)
+        
+        edge_count_deployed = 0
+        cloud_count = 0
+        edge_node_count = self._count_edge_nodes()
         
         for plan in deployment_plan:
             node_id = plan['node_id']
-            used_resources += plan['cpu_demand'] + plan['memory_demand']
-            
-        total_capacity = len(node_resources) * 2
-        resource_utilization = used_resources / total_capacity if total_capacity > 0 else 0
+            if node_id < edge_node_count:
+                edge_count_deployed += 1
+            else:
+                cloud_count += 1
+                
+        total_services = len(deployment_plan)
+        edge_cloud_ratio = edge_count_deployed / total_services if total_services > 0 else 0.5
+        
+        service_availability = success_rate * (1.0 - reschedule_count / max(1, self.max_iterations))
+        
+        deployment_cost = self._calculate_deployment_cost(deployment_plan, total_distance)
         
         return {
             'success_rate': success_rate,
             'avg_latency': avg_latency,
+            'latency_variance': latency_variance,
             'reschedule_count': reschedule_count,
             'resource_utilization': resource_utilization,
-            'communication_cost': total_distance
+            'communication_cost': total_distance,
+            'match_score': match_score,
+            'deployment_cost': deployment_cost,
+            'service_availability': service_availability,
+            'network_load': network_load,
+            'load_balance_score': load_balance_score,
+            'edge_cloud_ratio': edge_cloud_ratio
+        }
+        
+    def _count_edge_nodes(self):
+        return max(1, self.resource_graph.get_node_count() // 2)
+    
+    def _calculate_deployment_cost(self, deployment_plan, total_distance):
+        var_cost = self._calculate_variance_cost(deployment_plan)
+        return total_distance * 0.5 + var_cost * 0.5
+        
+    def run_full_experiment(self, max_iterations=None):
+        if max_iterations is not None:
+            self.max_iterations = max_iterations
+            
+        experiment_results = []
+        
+        state, valid, message = self.reset()
+        
+        while self.iteration_count < self.max_iterations:
+            next_state, reward, done, info = self.step()
+            
+            experiment_results.append({
+                'iteration': self.iteration_count,
+                'match_score': info.get('match_score', 0),
+                'metrics': info.get('metrics', {}),
+                'feedback': info.get('feedback', {}),
+                'cost': info.get('cost', 0)
+            })
+            
+            if info.get('converged', False):
+                break
+                
+            state = next_state
+            
+        summary = self.feedback_optimizer.get_experiment_summary()
+        
+        return {
+            'iterations': experiment_results,
+            'summary': summary,
+            'final_state': state,
+            'converged': self.iteration_count < self.max_iterations
         }
         
     def get_resource_graph(self):
@@ -198,8 +313,12 @@ def test_env():
     print(f"Step: reward={reward:.2f}, done={done}")
     print(f"Cost: {info['cost']:.2f}")
     print(f"Metrics: {info['metrics']}")
-    print(f"Feedback: {info['feedback']}")
     
+    print("\n=== Running Full Experiment ===")
+    result = env.run_full_experiment(max_iterations=10)
+    print(f"Converged: {result['converged']}")
+    print(f"Summary: {result['summary']}")
+
 
 if __name__ == '__main__':
     test_env()

@@ -1,172 +1,110 @@
 <?xml version="1.0" encoding="utf-8"?>
 <data>
-	<number>
-		<nodeNumber>5</nodeNumber>
-		<containerNumber>8
-			<service>0</service>
-			<service>1</service>
-			<service>2</service>
-			<service>3</service>
-			<service>4</service>
-			<service>5</service>
-			<service>6</service>
-			<service>7</service>
-		</containerNumber>
-		<serviceNumber>8
+	<uavnode>
+		<nodeNumber>5
+			<n1>1
+				<Id>1</Id>
+				<CPU>2</CPU>
+				<Memory>128</Memory>
+			</n1>
+			<n2>1
+				<Id>2</Id>
+				<CPU>2</CPU>
+				<Memory>128</Memory>
+			</n2>
+			<n3>1
+				<Id>3</Id>
+				<CPU>2</CPU>
+				<Memory>128</Memory>
+			</n3>
+			<n4>1
+				<Id>4</Id>
+				<CPU>2</CPU>
+				<Memory>128</Memory>
+			</n4>
+			<n5>1
+				<Id>5</Id>
+				<CPU>2</CPU>
+				<Memory>128</Memory>
+			</n5>
+			<n6>1
+				<Id>6</Id>
+				<CPU>2</CPU>
+				<Memory>128</Memory>
+			</n6>
+			<n7>1
+				<Id>7</Id>
+				<CPU>2</CPU>
+				<Memory>128</Memory>
+			</n7>
+			<n8>1
+				<Id>8</Id>
+				<CPU>2</CPU>
+				<Memory>128</Memory>
+			</n8>
+		</nodeNumber>
+
+		<nodeEdge>
+			<e1>1
+				<src>1</src>
+				<dst>2</dst>
+				<bandwith>100</bandwith>
+				<lantency>10</lantency>
+			</e1>
+		</nodeEdge>
+	</uavnode>
+
+	<servicenode>
+		<nodeNumber>8
 			<s1>1
-				<container>0
-					<CPU>2</CPU>
-					<Memory>128</Memory>
-				</container>
+				<Id>1</Id>
+				<CPU>2</CPU>
+				<Memory>128</Memory>
 			</s1>
 			<s2>1
-				<container>1
-					<CPU>3</CPU>
-					<Memory>256</Memory>
-				</container>
+				<Id>2</Id>
+				<CPU>3</CPU>
+				<Memory>256</Memory>
 			</s2>
 			<s3>1
-				<container>2
-					<CPU>2</CPU>
-					<Memory>256</Memory>
-				</container>
+				<Id>3</Id>
+				<CPU>2</CPU>
+				<Memory>256</Memory>
 			</s3>
 			<s4>1
-				<container>3
-					<CPU>3</CPU>
-					<Memory>256</Memory>
-				</container>
+				<Id>4</Id>
+				<CPU>3</CPU>
+				<Memory>256</Memory>
 			</s4>
 			<s5>1
-				<container>4
-					<CPU>2</CPU>
-					<Memory>256</Memory>
-				</container>
+				<Id>5</Id>
+				<CPU>2</CPU>
+				<Memory>256</Memory>
 			</s5>
 			<s6>1
-				<container>5
-					<CPU>3</CPU>
-					<Memory>128</Memory>
-				</container>
+				<Id>6</Id>
+				<CPU>3</CPU>
+				<Memory>128</Memory>
 			</s6>
 			<s7>1
-				<container>6
-					<CPU>1</CPU>
-					<Memory>128</Memory>
-				</container>
+				<Id>7</Id>
+				<CPU>1</CPU>
+				<Memory>128</Memory>
 			</s7>
 			<s8>1
-				<container>7
-					<CPU>2</CPU>
-					<Memory>128</Memory>
-				</container>
+				<Id>8</Id>
+				<CPU>2</CPU>
+				<Memory>128</Memory>
 			</s8>
-		</serviceNumber>
-		<resourceType>2</resourceType>
-	</number>
-	<distance>
-			<value>0</value>
-			<value>1</value>
-			<value>1</value>
-			<value>1</value>
-			<value>1</value>
-			
-			<value>1</value>
-			<value>0</value>
-			<value>1</value>
-			<value>1</value>
-			<value>1</value>
-			
-			<value>1</value>
-			<value>1</value>
-			<value>0</value>
-			<value>1</value>
-			<value>1</value>
+		</nodeNumber>
 
-			<value>1</value>
-			<value>1</value>
-			<value>1</value>
-			<value>0</value>
-			<value>1</value>
-
-			<value>1</value>
-			<value>1</value>
-			<value>1</value>
-			<value>1</value>
-			<value>0</value>
-
-	</distance>
-	<weight>
-			<value>0</value>
-			<value>27</value>
-			<value>1</value>
-			<value>26</value>
-			<value>1</value>
-			<value>20</value>
-			<value>295</value>
-			<value>1.5</value>
-			
-			<value>27</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			
-			<value>1</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-
-			<value>26</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-
-			<value>1</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			
-			<value>20</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			
-			<value>295</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			
-			<value>1.5</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-			<value>0</value>
-	</weight>
+		<nodeEdge>
+			<e1>1
+				<src>1</src>
+				<dst>2</dst>
+				<bandwith>100</bandwith>
+				<lantency>10</lantency>
+			</e1>
+		</nodeEdge>
+	</servicenode>
 </data>

@@ -2,8 +2,6 @@
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
-from resource_graph import ResourceTopologyGraph
-from task_graph import TaskTopologyGraph
 
 
 class GraphMatcher:
@@ -30,11 +28,25 @@ class GraphMatcher:
         service_feature = self.task_graph.get_service_feature(service_id)
         node_feature = self.resource_graph.get_node_feature(node_id)
         
-        cpu_match = 1.0 - abs(service_feature[0] - node_feature[0])
-        mem_match = 1.0 - abs(service_feature[1] - node_feature[1])
+        if service_id < len(self.task_graph.services):
+            service = self.task_graph.services[service_id]
+            cpu_demand = service['cpu_demand']
+            mem_demand = service['memory_demand']
+        else:
+            return 0.0
+            
+        if node_id < len(self.resource_graph.nodes):
+            node = self.resource_graph.nodes[node_id]
+            cpu_capacity = node['cpu']
+            mem_capacity = node['memory']
+        else:
+            return 0.0
+            
+        cpu_match = 1.0 - abs(cpu_demand - cpu_capacity) / max(cpu_capacity, 1)
+        mem_match = 1.0 - abs(mem_demand - mem_capacity) / max(mem_capacity, 1)
         
-        similarity = 0.6 * cpu_match + 0.4 * mem_match
-        return max(0, similarity)
+        similarity = 0.6 * max(0, cpu_match) + 0.4 * max(0, mem_match)
+        return similarity
         
     def _calculate_edge_similarity(self, service_pairs, node_pairs):
         if not service_pairs or not node_pairs:
@@ -44,14 +56,14 @@ class GraphMatcher:
         count = 0
         
         for s1, s2 in service_pairs:
-            s1_node = node_pairs[s1] if s1 in node_pairs else -1
-            s2_node = node_pairs[s2] if s2 in node_pairs else -1
+            s1_node = node_pairs.get(s1, -1)
+            s2_node = node_pairs.get(s2, -1)
             
             if s1_node >= 0 and s2_node >= 0:
                 service_dist = self.task_graph.get_edge_weight(s1, s2)
                 node_dist = self.resource_graph.get_shortest_path_distance(s1_node, s2_node)
                 
-                if node_dist > 0:
+                if node_dist > 0 and node_dist < float('inf'):
                     similarity = service_dist / (service_dist + node_dist)
                     total_similarity += similarity
                     count += 1
@@ -61,6 +73,9 @@ class GraphMatcher:
     def _build_cost_matrix(self):
         n_services = self.task_graph.get_service_count()
         n_nodes = self.resource_graph.get_node_count()
+        
+        if n_services == 0 or n_nodes == 0:
+            return np.zeros((1, 1))
         
         cost_matrix = np.zeros((n_services, n_nodes))
         
@@ -74,11 +89,19 @@ class GraphMatcher:
     def _hungarian_matching(self):
         cost_matrix = self._build_cost_matrix()
         
+        n_services = cost_matrix.shape[0]
+        n_nodes = cost_matrix.shape[1]
+        
+        if n_services > n_nodes:
+            larger = n_services
+            cost_matrix = np.pad(cost_matrix, ((0, larger - n_services), (0, larger - n_nodes)), mode='constant', constant_values=1000)
+        
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         
         mapping = {}
         for i, j in zip(row_ind, col_ind):
-            mapping[i] = j
+            if i < self.task_graph.get_service_count() and j < self.resource_graph.get_node_count():
+                mapping[i] = j
             
         return mapping
         
@@ -178,17 +201,18 @@ class GraphMatcher:
         if len(self.mapping) != n_services:
             return False, f"Mapping incomplete: {len(self.mapping)}/{n_services}"
             
-        if len(set(self.mapping.values())) != n_services:
+        if len(set(self.mapping.values())) != len(self.mapping):
             return False, "Duplicate node assignment"
             
         for service_id, node_id in self.mapping.items():
             service_demand = self.task_graph.get_service_resource_demand(service_id)
-            node_capacity = self.resource_graph.get_node_resource_capacity()[node_id]
-            
-            if service_demand['cpu'] > node_capacity['cpu']:
-                return False, f"Service {service_id} CPU demand exceeds Node {node_id} capacity"
-            if service_demand['memory'] > node_capacity['memory']:
-                return False, f"Service {service_id} Memory demand exceeds Node {node_id} capacity"
+            if node_id < len(self.resource_graph.nodes):
+                node_capacity = self.resource_graph.nodes[node_id]
+                
+                if service_demand['cpu'] > node_capacity['cpu']:
+                    return False, f"Service {service_id} CPU demand exceeds Node {node_id} capacity"
+                if service_demand['memory'] > node_capacity['memory']:
+                    return False, f"Service {service_id} Memory demand exceeds Node {node_id} capacity"
                 
         return True, "Valid mapping"
         
@@ -200,12 +224,15 @@ class GraphMatcher:
             return []
             
         deployment_plan = []
+        
         for service_id, node_id in self.mapping.items():
-            deployment_plan.append({
-                'service_id': service_id,
-                'node_id': node_id,
-                'cpu_demand': self.task_graph.get_service_resource_demand(service_id)['cpu'],
-                'memory_demand': self.task_graph.get_service_resource_demand(service_id)['memory']
-            })
-            
+            if service_id < len(self.task_graph.services):
+                service = self.task_graph.services[service_id]
+                deployment_plan.append({
+                    'service_id': service_id,
+                    'node_id': node_id,
+                    'cpu_demand': service['cpu_demand'],
+                    'memory_demand': service['memory_demand']
+                })
+                
         return deployment_plan
