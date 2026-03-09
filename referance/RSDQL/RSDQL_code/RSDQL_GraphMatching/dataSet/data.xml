@@ -50,6 +50,7 @@
 				<dst>2</dst>
 				<bandwith>100</bandwith>
 				<lantency>10</lantency>
+				<loss>0.01</loss>
 			</e1>
 		</nodeEdge>
 	</uavnode>

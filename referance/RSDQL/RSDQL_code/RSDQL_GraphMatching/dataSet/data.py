@@ -38,9 +38,10 @@ class Data:
                 dst = int(edge_elem.find('dst').text)
                 bandwidth = _get_element_text(edge_elem, 'bandwith', 'bandwidth', default=100)
                 latency = _get_element_text(edge_elem, 'lantency', 'latency', default=10)
-                self.uav_nodes[src].add_src_edge(src, dst, bandwidth, latency)
-                self.uav_nodes[dst].add_dst_edge(src, dst, bandwidth, latency)
-                self.uav_edges.append(Edge(src, dst, bandwidth, latency))
+                loss = _get_element_text(edge_elem, 'loss', default=0.01)
+                self.uav_nodes[src].add_src_edge(src, dst, bandwidth, latency, loss)
+                self.uav_nodes[dst].add_dst_edge(src, dst, bandwidth, latency, loss)
+                self.uav_edges.append(Edge(src, dst, bandwidth, latency, loss))
 
         servicenode = root.find('servicenode')
         for node_elem in servicenode.find('nodeNumber'):
@@ -56,9 +57,9 @@ class Data:
                 dst = int(edge_elem.find('dst').text)
                 bandwidth = _get_element_text(edge_elem, 'bandwith', 'bandwidth', default=100)
                 latency = _get_element_text(edge_elem, 'lantency', 'latency', default=10)
-                self.service_nodes[src].add_src_edge(src, dst, bandwidth, latency)
-                self.service_nodes[dst].add_dependencies(src, dst, bandwidth, latency)
-                self.service_edges.append(Edge(src, dst, bandwidth, latency))
+                self.service_nodes[src].add_src_edge(src, dst, bandwidth, latency, 0.0)
+                self.service_nodes[dst].add_dependencies(src, dst, bandwidth, latency, 0.0)
+                self.service_edges.append(Edge(src, dst, bandwidth, latency, 0.0))
 
 
 class UAV:
@@ -72,20 +73,22 @@ class UAV:
         self.dst_edges = []
         self.services = []
 
-    def add_src_edge(self, src, dst, bandwidth, latency):
+    def add_src_edge(self, src, dst, bandwidth, latency, loss):
         self.src_edges.append({
             'src': src,
             'dst': dst,
             'bandwidth': bandwidth,
-            'latency': latency
+            'latency': latency,
+            'loss': loss
         })
 
-    def add_dst_edge(self, src, dst, bandwidth, latency):
+    def add_dst_edge(self, src, dst, bandwidth, latency, loss):
         self.dst_edges.append({
             'src': src,
             'dst': dst,
             'bandwidth': bandwidth,
-            'latency': latency
+            'latency': latency,
+            'loss': loss
         })
 
     def __repr__(self):
@@ -101,20 +104,22 @@ class Service:
         self.dependencies = []
         self.node = 0
 
-    def add_src_edge(self, src, dst, bandwidth, latency):
+    def add_src_edge(self, src, dst, bandwidth, latency, loss):
         self.src_edges.append({
             'src': src,
             'dst': dst,
             'bandwidth': bandwidth,
-            'latency': latency
+            'latency': latency,
+            'loss': loss
         })
 
-    def add_dependencies(self, src, dst, bandwidth, latency):
+    def add_dependencies(self, src, dst, bandwidth, latency, loss):
         self.dependencies.append({
             'src': src,
             'dst': dst,
             'bandwidth': bandwidth,
-            'latency': latency
+            'latency': latency,
+            'loss': loss
         })
 
     def __repr__(self):
@@ -122,14 +127,15 @@ class Service:
 
 
 class Edge:
-    def __init__(self, src, dst, bandwidth, latency):
+    def __init__(self, src, dst, bandwidth, latency, loss):
         self.src = src
         self.dst = dst
         self.bandwidth = bandwidth
         self.latency = latency
+        self.loss = loss
 
     def __repr__(self):
-        return f"Edge({self.src}->{self.dst}, bandwidth={self.bandwidth:.2f}, latency={self.latency:.2f})"
+        return f"Edge({self.src}->{self.dst}, bandwidth={self.bandwidth:.2f}, latency={self.latency:.2f}, loss={self.loss:.2f})"
 
 
 def test_data_loading():

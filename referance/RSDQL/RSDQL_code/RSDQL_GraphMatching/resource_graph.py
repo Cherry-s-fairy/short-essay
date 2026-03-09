@@ -1,6 +1,7 @@
 #-*- coding: utf-8 -*-
 
 import numpy as np
+import math
 
 
 class ResourceTopologyGraph:
@@ -32,17 +33,38 @@ class ResourceTopologyGraph:
                 'out_edge_count': edge_count,
                 'out_bandwidth': out_bandwidth,
                 'out_latency': out_latency,
-                'src_edges': node.src_edges
+                'src_edges': node.src_edges,
             })
             
     def _build_edges(self):
+        edges_data = []
         for edge in self.data.uav_edges:
-            self.edges.append({
+            weight = math.log(edge.bandwidth * edge.latency * (1 - edge.loss) + 1)
+            edges_data.append({
                 'src': edge.src,
                 'dst': edge.dst,
                 'bandwidth': edge.bandwidth,
                 'latency': edge.latency,
-                'weight': edge.latency
+                'loss': edge.loss if hasattr(edge, 'loss') else 0,
+                'weight': weight
+            })
+
+
+        max_weight = max(e['weight'] for e in edges_data) if edges_data else 1
+        min_weight = min(e['weight'] for e in edges_data) if edges_data else 0
+
+        for e in edges_data:
+            if max_weight > min_weight:
+                weight = (e['weight'] - min_weight) / (max_weight - min_weight)
+            else:
+                weight = 0.5
+            self.edges.append({
+                'src': e['src'],
+                'dst': e['dst'],
+                'bandwidth': e['bandwidth'],
+                'latency': e['latency'],
+                'loss': e['loss'],
+                'weight': weight
             })
         
         for node1_id in self.data.uav_nodes:
@@ -59,6 +81,7 @@ class ResourceTopologyGraph:
                             'dst': node2_id,
                             'bandwidth': 0,
                             'latency': float('inf'),
+                            'loss': 1,
                             'weight': float('inf')
                         })
                         
@@ -156,7 +179,11 @@ def test_resource_graph():
     print("\n--- Nodes ---")
     for i, node in enumerate(resource_graph.nodes):
         print(f"  Node {i}: cpu={node['total_cpu']}, mem={node['total_memory']}, out_edges={node['out_edge_count']}, src_edges={node['src_edges']}")
-    
+
+    print("\n--- Edges ---")
+    for edge in resource_graph.edges:
+        print(f"  Edge: {edge['src']} -> {edge['dst']}, bandwidth={edge['bandwidth']}, latency={edge['latency']}, loss={edge['loss']}, weight={edge['weight']}")
+
     print("\n--- Distance Matrix ---")
     print(resource_graph.distance_matrix)
     
