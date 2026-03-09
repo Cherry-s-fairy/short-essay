@@ -48,8 +48,8 @@
 			<e1>1
 				<src>1</src>
 				<dst>2</dst>
-				<bandwith>100</bandwith>
-				<lantency>10</lantency>
+				<bandwidth>100</bandwidth>
+				<latency>10</latency>
 				<loss>0.01</loss>
 			</e1>
 		</nodeEdge>
@@ -103,8 +103,10 @@
 			<e1>1
 				<src>1</src>
 				<dst>2</dst>
-				<bandwith>100</bandwith>
-				<lantency>10</lantency>
+				<bandwidth>100</bandwidth>
+				<latency>10</latency>
+				<loss>0.01</loss>
+				<data>100</data>
 			</e1>
 		</nodeEdge>
 	</servicenode>
