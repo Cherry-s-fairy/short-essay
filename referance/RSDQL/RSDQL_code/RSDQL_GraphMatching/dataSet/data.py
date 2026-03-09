@@ -144,7 +144,7 @@ class Edge:
 
 
 def test_data_loading():
-    data = Data('data.xml')
+    data = Data('dataSet/data.xml')
 
     print("=== UAV Nodes ===")
     for node_id, node in data.uav_nodes.items():

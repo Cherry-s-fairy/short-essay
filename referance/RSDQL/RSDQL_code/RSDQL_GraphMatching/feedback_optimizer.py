@@ -58,18 +58,24 @@ class FeedbackOptimizer:
             'latency': 100.0,
             'reschedule': 3,
             'utilization': 0.5,
-            'match_score': 0.6
+            'match_score': 0.6,
+            'r_max': 0.9,
+            'tau_max': 100.0,
+            'comm_cost_threshold': 50.0
         }
         self.weight_config = {
             'success_rate': 0.3,
             'latency': 0.25,
             'reschedule': 0.2,
             'utilization': 0.15,
-            'load_balance': 0.1
+            'load_balance': 0.1,
+            'lambda1': 0.5,
+            'lambda2': 0.5
         }
         self.best_metrics = None
         self.convergence_count = 0
         self.max_convergence_iterations = 5
+        self.critical_tasks = []
         
     def collect_metrics(self, deployment_result):
         metrics = DeploymentMetrics()
@@ -112,26 +118,59 @@ class FeedbackOptimizer:
         params = {}
         reasons = []
         
+        r_success = recent_metrics.success_rate
+        t_latency = recent_metrics.avg_latency
+        f_resched = recent_metrics.reschedule_count
+        r_max = self.adaptation_threshold['r_max']
+        tau_max = self.adaptation_threshold['tau_max']
+        comm_cost_threshold = self.adaptation_threshold['comm_cost_threshold']
+        
+        self._identify_critical_tasks(recent_metrics)
+        
+        if r_success < r_max and t_latency > tau_max:
+            for task in self.critical_tasks:
+                task_latency = task.get('latency', 0)
+                task_success = task.get('success_rate', 0)
+                
+                if task_success > r_max and task_latency > comm_cost_threshold:
+                    adjustment_type = 'split_high_latency'
+                    params['latency_threshold'] = tau_max
+                    params['success_threshold'] = r_max
+                    params['scale_factor'] = 0.5
+                    reasons.append('critical_task_split')
+                    break
+                    
+        if t_latency > tau_max and recent_metrics.communication_cost > comm_cost_threshold:
+            adjustment_type = 'merge_communication'
+            params['comm_cost_threshold'] = comm_cost_threshold
+            params['merge_dependent'] = True
+            reasons.append('merge_high_communication')
+            
+        if adjustment_type == 'none':
+            adjustment_type = 'adjust_priority'
+            params['lambda1'] = self.weight_config['lambda1']
+            params['lambda2'] = self.weight_config['lambda2']
+            params['threshold'] = 0.5
+            reasons.append('adjust_priority')
+            
         if recent_metrics.match_score < self.adaptation_threshold['match_score']:
             if recent_metrics.success_rate < self.adaptation_threshold['success_rate']:
-                adjustment_type = 'reduce_dependency'
                 params['threshold'] = 0.5
                 params['scale_factor'] = 0.9
                 reasons.append('low_match_and_success')
             else:
-                adjustment_type = 'optimize_dependency'
                 params['threshold'] = 0.7
                 reasons.append('low_match')
                 
-        if recent_metrics.avg_latency > self.adaptation_threshold['latency']:
-            adjustment_type = 'reduce_dependency'
+        if t_latency > tau_max:
+            adjustment_type = 'modify_dependency'
             params['threshold'] = max(params.get('threshold', 0.5) - 0.2, 0.2)
-            params['merge_dependent'] = True
             reasons.append('high_latency')
             
-        if recent_metrics.reschedule_count > self.adaptation_threshold['reschedule']:
-            adjustment_type = 'decrease_capacity'
-            params['scale_factor'] = max(0.7, 1.0 - recent_metrics.reschedule_count * 0.1)
+        if f_resched > self.adaptation_threshold['reschedule']:
+            if adjustment_type == 'none':
+                adjustment_type = 'decrease_capacity'
+            params['scale_factor'] = max(0.7, 1.0 - f_resched * 0.1)
             params['strategy'] = 'uniform'
             reasons.append('high_reschedule')
             
@@ -158,6 +197,9 @@ class FeedbackOptimizer:
         feedback = {
             'adjustment_type': adjustment_type,
             'reasons': reasons,
+            'r_success': r_success,
+            't_latency': t_latency,
+            'f_resched': f_resched,
             'success_rate': recent_metrics.success_rate,
             'latency': recent_metrics.avg_latency,
             'reschedule_count': recent_metrics.reschedule_count,
@@ -166,11 +208,38 @@ class FeedbackOptimizer:
             'communication_cost': recent_metrics.communication_cost,
             'load_balance_score': recent_metrics.load_balance_score,
             'iteration': recent_metrics.iteration,
+            'critical_tasks': self.critical_tasks,
             'convergence': self.convergence_count >= self.max_convergence_iterations,
             **params
         }
         
         return feedback
+        
+    def _identify_critical_tasks(self, metrics):
+        self.critical_tasks = []
+        
+        if not self.task_graph or not self.task_graph.services:
+            return
+            
+        task_count = len(self.task_graph.services)
+        
+        for i, service in enumerate(self.task_graph.services):
+            service_latency = 0
+            for edge in self.task_graph.edges:
+                if edge['src'] == service['id'] or edge['dst'] == service['id']:
+                    service_latency += edge.get('latency', 0)
+            
+            task_success = metrics.success_rate * (1 - service_latency / max(1, self.adaptation_threshold['tau_max']))
+            task_success = max(0, min(1, task_success))
+            
+            if service_latency > self.adaptation_threshold['tau_max'] or task_success < self.adaptation_threshold['success_rate']:
+                self.critical_tasks.append({
+                    'id': service['id'],
+                    'latency': service_latency,
+                    'success_rate': task_success,
+                    'cpu_demand': service['cpu_demand'],
+                    'memory_demand': service['memory_demand']
+                })
         
     def _check_convergence(self, metrics):
         if len(self.history) < 2:
