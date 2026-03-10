@@ -56,7 +56,20 @@ class Env:
     def step(self, action=None):
         if self.current_mapping is None:
             return self.state, -100, True, {}
-            
+        
+        if action is not None and action < 5:
+            if action == 0:
+                self.matcher.match(method='greedy')
+            elif action == 1:
+                self.matcher.match(method='hungarian')
+            elif action == 2:
+                self.matcher.match(method='learned')
+            elif action == 3:
+                self.matcher.match(method='heuristic')
+            elif action == 4:
+                self.matcher.match(method='hungarian')
+                self.matcher.match(method='greedy')
+        
         deployment_plan = self.matcher.get_deployment_plan()
         
         cost, comm_cost, var_cost = self._calculate_cost(deployment_plan)

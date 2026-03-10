@@ -37,8 +37,8 @@ class GraphMatcher:
             
         if node_id < len(self.resource_graph.nodes):
             node = self.resource_graph.nodes[node_id]
-            cpu_capacity = node['cpu']
-            mem_capacity = node['memory']
+            cpu_capacity = node.get('total_cpu', node.get('cpu', 0))
+            mem_capacity = node.get('total_memory', node.get('memory', 0))
         else:
             return 0.0
             
@@ -209,9 +209,9 @@ class GraphMatcher:
             if node_id < len(self.resource_graph.nodes):
                 node_capacity = self.resource_graph.nodes[node_id]
                 
-                if service_demand['cpu'] > node_capacity['cpu']:
+                if service_demand['cpu'] > node_capacity.get('total_cpu', node_capacity.get('cpu', 0)):
                     return False, f"Service {service_id} CPU demand exceeds Node {node_id} capacity"
-                if service_demand['memory'] > node_capacity['memory']:
+                if service_demand['memory'] > node_capacity.get('total_memory', node_capacity.get('memory', 0)):
                     return False, f"Service {service_id} Memory demand exceeds Node {node_id} capacity"
                 
         return True, "Valid mapping"

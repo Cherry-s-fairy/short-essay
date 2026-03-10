@@ -1,0 +1,20 @@
+{
+  "timestamp": "2026-03-10T16:13:29.375500",
+  "num_experiments": 10,
+  "analysis": {
+    "success_rate": {
+      "mean": 0.364,
+      "std": 0.0,
+      "min": 0.364,
+      "max": 0.364
+    },
+    "match_score": {
+      "mean": 0.45499999999999996,
+      "std": 0.0,
+      "min": 0.45499999999999996,
+      "max": 0.45499999999999996
+    },
+    "latency": {
+      "mean": 0.0,
+      "std": 0.0,
+      "min": 
