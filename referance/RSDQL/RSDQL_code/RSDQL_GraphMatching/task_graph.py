@@ -308,21 +308,21 @@ class TaskTopologyGraph:
         return self
         
     def _build_services(self):
-        for service_id, service in self.data.service_nodes.items():
+        for task_id, task in self.data.task_nodes.items():
             self.services.append({
-                'id': service.id,
-                'cpu_demand': service.cpu_demand,
-                'memory_demand': service.memory_demand,
-                'dependencies': service.dependencies.copy()
+                'id': task.id,
+                'cpu_demand': task.cpu_demand,
+                'memory_demand': task.memory_demand,
+                'dependencies': task.dependencies.copy()
             }) 
-            self._service_resources[service.id] = {
-                'cpu': service.cpu_demand,
-                'memory': service.memory_demand
+            self._service_resources[task.id] = {
+                'cpu': task.cpu_demand,
+                'memory': task.memory_demand
             }
             
     def _build_dependencies(self):
-        for service_id, service in self.data.service_nodes.items():
-            for dep in service.dependencies:
+        for task_id, task in self.data.task_nodes.items():
+            for dep in task.dependencies:
                 basic = dep['data'] * 8 / dep['bandwidth'] + dep['latency']
                 weight = basic * (1 + dep['loss'] + 5)
                 self.edges.append({
@@ -813,7 +813,7 @@ def test_resource_aware_generator():
     print("\n--- Test 2: Generate Task Features ---")
     for i, service in enumerate(task_graph.services[:3]):
         task_embedding, feasible_neighbors = generator.generate_task_features(service)
-        print(f"  Service {i}:")
+        print(f"  Task {i}:")
         print(f"    Embedding: {task_embedding}")
         print(f"    Feasible UAV neighbors: {feasible_neighbors}")
     
@@ -906,8 +906,8 @@ def test_task_graph():
     print("="*60)
     
     data = Data('dataSet/data.xml')
-    print(f"\nLoaded {len(data.service_nodes)} service nodes")
-    print(f"Loaded {len(data.service_edges)} service edges")
+    print(f"\nLoaded {len(data.task_nodes)} task nodes")
+    print(f"Loaded {len(data.task_edges)} task edges")
     
     task_graph = TaskTopologyGraph(data)
     task_graph.build_from_data()
@@ -916,7 +916,7 @@ def test_task_graph():
     
     print("\n--- Services ---")
     for i, service in enumerate(task_graph.services):
-        print(f"  Service {i}: cpu={service['cpu_demand']}, mem={service['memory_demand']}, deps={len(service['dependencies'])}")
+        print(f"  Task {i}: cpu={service['cpu_demand']}, mem={service['memory_demand']}, deps={len(service['dependencies'])}")
     
     print("\n--- Dependencies ---")
     for edge in task_graph.edges:
@@ -925,10 +925,10 @@ def test_task_graph():
     print("\n--- Communication Matrix ---")
     print(task_graph.communication_matrix)
     
-    print("\n--- Service Features ---")
+    print("\n--- Task Features ---")
     for i in range(task_graph.get_service_count()):
         feature = task_graph.get_service_feature(i)
-        print(f"  Service {i}: {feature}")
+        print(f"  Task {i}: {feature}")
     
     print("\n--- Topology Stats ---")
     stats = task_graph.get_topology_stats()
@@ -976,7 +976,7 @@ def test_task_graph():
     print(f"After priority adjust: {task_graph}")
     for i, service in enumerate(task_graph.services):
         priority = service.get('priority', 'N/A')
-        print(f"  Service {i} priority: {priority}")
+        print(f"  Task {i} priority: {priority}")
     
     task_graph = TaskTopologyGraph(data)
     task_graph.build_from_data()
@@ -1000,7 +1000,7 @@ def test_task_graph():
     print(f"Original: {task_graph}")
     print(f"Variation: {variation}")
     for i, service in enumerate(variation.services):
-        print(f"  Service {i}: cpu={service['cpu_demand']:.2f}, mem={service['memory_demand']:.2f}")
+        print(f"  Task {i}: cpu={service['cpu_demand']:.2f}, mem={service['memory_demand']:.2f}")
     
     print("\n--- Test 6: Clone ---")
     cloned = task_graph.clone()

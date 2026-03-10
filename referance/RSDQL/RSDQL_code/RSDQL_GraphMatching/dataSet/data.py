@@ -21,9 +21,9 @@ class Data:
         root = tree.getroot()
 
         self.uav_nodes = {}
-        self.service_nodes = {}
+        self.task_nodes = {}
         self.uav_edges = []
-        self.service_edges = []
+        self.task_edges = []
 
         uavnode = root.find('uavnode')
         for node_elem in uavnode.find('nodeNumber'):
@@ -44,14 +44,14 @@ class Data:
                 self.uav_nodes[dst].add_dst_edge(src, dst, bandwidth, latency, loss)
                 self.uav_edges.append(Edge(src, dst, bandwidth, latency, loss, 0))
 
-        servicenode = root.find('servicenode')
-        for node_elem in servicenode.find('nodeNumber'):
+        tasknode = root.find('tasknode')
+        for node_elem in tasknode.find('nodeNumber'):
             node_id = int(node_elem.find('Id').text)
             cpu_demand = float(node_elem.find('CPU').text)
             memory_demand = float(node_elem.find('Memory').text)
-            self.service_nodes[node_id] = Service(node_id, cpu_demand, memory_demand)
+            self.task_nodes[node_id] = Task(node_id, cpu_demand, memory_demand)
 
-        nodeEdge = servicenode.find('nodeEdge')
+        nodeEdge = tasknode.find('nodeEdge')
         if nodeEdge is not None:
             for edge_elem in nodeEdge:
                 src = int(edge_elem.find('src').text)
@@ -59,9 +59,9 @@ class Data:
                 bandwidth = _get_element_text(edge_elem, 'bandwidth', default=0)
                 latency = _get_element_text(edge_elem, 'latency', default=inf)
                 data = _get_element_text(edge_elem, 'data', default=0)
-                self.service_nodes[src].add_src_edge(src, dst, bandwidth, latency, 0, data)
-                self.service_nodes[dst].add_dependencies(src, dst, bandwidth, latency, 0, data)
-                self.service_edges.append(Edge(src, dst, bandwidth, latency, 0, data))
+                self.task_nodes[src].add_src_edge(src, dst, bandwidth, latency, 0, data)
+                self.task_nodes[dst].add_dependencies(src, dst, bandwidth, latency, 0, data)
+                self.task_edges.append(Edge(src, dst, bandwidth, latency, 0, data))
 
 
 class UAV:
@@ -73,7 +73,7 @@ class UAV:
         self.remain_memory = memory
         self.src_edges = []
         self.dst_edges = []
-        self.services = []
+        self.tasks = []
 
     def add_src_edge(self, src, dst, bandwidth, latency, loss):
         self.src_edges.append({
@@ -94,12 +94,12 @@ class UAV:
         })
 
     def __repr__(self):
-        return f"UAV(id={self.id}, total_cpu={self.total_cpu:.2f}, total_mem={self.total_memory:.2f}, remain_cpu={self.remain_cpu:.2f}, remain_mem={self.remain_memory:.2f}, src_edges={self.src_edges}, dst_edges={self.dst_edges}, service={self.services})"
+        return f"UAV(id={self.id}, total_cpu={self.total_cpu:.2f}, total_mem={self.total_memory:.2f}, remain_cpu={self.remain_cpu:.2f}, remain_mem={self.remain_memory:.2f}, src_edges={self.src_edges}, dst_edges={self.dst_edges}, tasks={self.tasks})"
 
 
-class Service:
-    def __init__(self, service_id, cpu_demand, memory_demand):
-        self.id = service_id
+class Task:
+    def __init__(self, task_id, cpu_demand, memory_demand):
+        self.id = task_id
         self.cpu_demand = cpu_demand
         self.memory_demand = memory_demand
         self.src_edges = []
@@ -127,7 +127,7 @@ class Service:
         })
 
     def __repr__(self):
-        return f"Service(id={self.id}, cpu={self.cpu_demand:.2f}, mem={self.memory_demand:.2f}, src_edges={self.src_edges}, dependencies={self.dependencies}, node={self.node})"
+        return f"Task(id={self.id}, cpu={self.cpu_demand:.2f}, mem={self.memory_demand:.2f}, src_edges={self.src_edges}, dependencies={self.dependencies}, node={self.node})"
 
 
 class Edge:
@@ -144,23 +144,23 @@ class Edge:
 
 
 def test_data_loading():
-    data = Data('dataSet/data.xml')
+    data = Data('data.xml')
 
     print("=== UAV Nodes ===")
     for node_id, node in data.uav_nodes.items():
         print(node)
 
-    print("\n=== Service Nodes ===")
-    for service_id, service in data.service_nodes.items():
-        print(service)
+    print("\n=== Task Nodes ===")
+    for task_id, task in data.task_nodes.items():
+        print(task)
 
     print("\n=== UAV Edges ===")
     for edge in data.uav_edges:
         print(f"  {edge.src} -> {edge.dst}: bw={edge.bandwidth:.2f}, lat={edge.latency:.2f}, loss={edge.loss:.2f}")
 
-    print("\n=== Service Edges ===")
-    for edge in data.service_edges:
-        print(f"  {edge.src} -> {edge.dst}: bw={edge.bandwidth:.2f}, lat={edge.latency:.2f}, loss={edge.loss:.2f}, data={edge.data}")
+    print("\n=== Task Edges ===")
+    for edge in data.task_edges:
+        print(f"  {edge.src} -> {edge.dst}: bw={edge.bandwidth:.2f}, lat={edge.latency:.2f}, data={edge.data}")
 
 if __name__ == "__main__":
     test_data_loading()

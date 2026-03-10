@@ -165,6 +165,22 @@ class ExperimentRunner:
     def export_results(self, filepath='experiment_results.json'):
         analysis = self.analyze_results()
         
+        def convert_to_native(obj):
+            if isinstance(obj, dict):
+                return {k: convert_to_native(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_to_native(item) for item in obj]
+            elif isinstance(obj, (np.integer, np.int64, np.int32)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                return obj
+        
+        analysis = convert_to_native(analysis)
+        
         export_data = {
             'timestamp': datetime.now().isoformat(),
             'num_experiments': len(self.results),

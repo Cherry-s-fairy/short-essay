@@ -11,7 +11,8 @@ class ResourceTopologyGraph:
         self.edges = []
         self.adjacency_matrix = None
         self.distance_matrix = None
-        
+
+    # 从加载的数据文件中构建资源拓扑图
     def build_from_data(self):
         self._build_nodes()
         self._build_edges()
