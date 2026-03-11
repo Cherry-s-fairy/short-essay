@@ -218,12 +218,12 @@ class FeedbackOptimizer:
     def _identify_critical_tasks(self, metrics):
         self.critical_tasks = []
         
-        if not self.task_graph or not self.task_graph.services:
+        if not self.task_graph or not self.task_graph.tasks:
             return
             
-        task_count = len(self.task_graph.services)
+        task_count = len(self.task_graph.tasks)
         
-        for i, service in enumerate(self.task_graph.services):
+        for i, service in enumerate(self.task_graph.tasks):
             service_latency = 0
             for edge in self.task_graph.edges:
                 if edge['src'] == service['id'] or edge['dst'] == service['id']:

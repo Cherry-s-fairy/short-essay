@@ -28,8 +28,8 @@ class GraphMatcher:
         service_feature = self.task_graph.get_service_feature(service_id)
         node_feature = self.resource_graph.get_node_feature(node_id)
         
-        if service_id < len(self.task_graph.services):
-            service = self.task_graph.services[service_id]
+        if service_id < len(self.task_graph.tasks):
+            service = self.task_graph.tasks[service_id]
             cpu_demand = service['cpu_demand']
             mem_demand = service['memory_demand']
         else:
@@ -226,8 +226,8 @@ class GraphMatcher:
         deployment_plan = []
         
         for service_id, node_id in self.mapping.items():
-            if service_id < len(self.task_graph.services):
-                service = self.task_graph.services[service_id]
+            if service_id < len(self.task_graph.tasks):
+                service = self.task_graph.tasks[service_id]
                 deployment_plan.append({
                     'service_id': service_id,
                     'node_id': node_id,

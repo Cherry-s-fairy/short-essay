@@ -24,6 +24,7 @@ class ResourceTopologyGraph:
             node = self.data.uav_nodes[node_id]
             out_bandwidth = sum(edge['bandwidth'] for edge in node.src_edges)
             out_latency = sum(edge['latency'] for edge in node.src_edges)
+            out_loss = sum(edge['loss'] for edge in node.src_edges)
             edge_count = len(node.src_edges)
             self.nodes.append({
                 'id': node.id,
@@ -34,6 +35,7 @@ class ResourceTopologyGraph:
                 'out_edge_count': edge_count,
                 'out_bandwidth': out_bandwidth,
                 'out_latency': out_latency,
+                'out_loss': out_loss,
                 'src_edges': node.src_edges,
             })
             
@@ -83,7 +85,7 @@ class ResourceTopologyGraph:
                             'bandwidth': 0,
                             'latency': float('inf'),
                             'loss': 1,
-                            'weight': float('inf')
+                            'weight': float('0')
                         })
                         
     def _build_matrices(self):

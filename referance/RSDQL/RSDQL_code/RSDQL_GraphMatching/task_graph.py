@@ -2,6 +2,10 @@
 
 import numpy as np
 import random
+import torch
+import torch.nn.functional as F
+from torch_geometric.data import Data
+from torch_geometric.nn import GATConv
 
 
 class ResourceAwareTaskGraphGenerator:
@@ -14,37 +18,138 @@ class ResourceAwareTaskGraphGenerator:
         self.max_iterations = 10
         self.convergence_threshold = 0.05
         self.history = []
-        
+
+        # GAT参数
+        self.gnn_hidden_dim = 32
+        self.gnn_num_layers = 3
+        self.num_heads = 4
+        self.dropout = 0.1
+
+        # 初始化PyG的GAT模型（核心修改点1：替换手动GAT为PyG的GATConv）
+        self.gat_model = self._build_gat_model()
+        # 设置为推理模式（默认不训练，如需训练可改为train()）
+        self.gat_model.eval()
+
+        # 设备选择（自动选择GPU/CPU）
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.gat_model = self.gat_model.to(self.device)
+
+    # 构建PyG的GAT模型（核心：多层GATConv）
+    def _build_gat_model(self):
+        class GATEncoder(torch.nn.Module):
+            def __init__(self, input_dim=7, hidden_dim=32, num_layers=3, num_heads=4, dropout=0.1):
+                super().__init__()
+                self.gat_layers = torch.nn.ModuleList()
+                self.dropout = dropout
+                # 第一层：输入维度→隐藏维度（多头拼接）
+                self.gat_layers.append(
+                    GATConv(input_dim, hidden_dim // num_heads, heads=num_heads, dropout=dropout, edge_dim=1)
+                )
+                # 中间层：隐藏维度→隐藏维度（多头拼接）
+                for _ in range(num_layers - 2):
+                    self.gat_layers.append(
+                        GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads, dropout=dropout)
+                    )
+                # 最后一层：隐藏维度→隐藏维度（单头平均）
+                self.gat_layers.append(
+                    GATConv(hidden_dim, hidden_dim, heads=1, concat=False, dropout=dropout)
+                )
+
+            # 前向传播：节点特征 → 多层GAT → 节点嵌入
+            def forward(self, x, edge_index, edge_attr):
+                h = x
+                for i, layer in enumerate(self.gat_layers):
+                    h = layer(h, edge_index, edge_attr=edge_attr)
+                    if i != len(self.gat_layers) - 1:
+                        h = F.relu(h)
+                        h = F.dropout(h, p=self.dropout, training=self.training)
+                return h
+
+        # 实例化GAT模型
+        model = GATEncoder(
+            input_dim=3,
+            hidden_dim=self.gnn_hidden_dim,
+            num_layers=self.gnn_num_layers,
+            num_heads=self.num_heads,
+            dropout=self.dropout
+        )
+        return model
+
+    # 将自定义resource_graph转换为PyG的Data格式
+    def _convert_to_pyg_data(self):
+        nodes = self.resource_graph.nodes
+        num_nodes = len(nodes)
+        if num_nodes == 0:
+            return None
+
+        # 1. 提取并归一化节点特征
+        node_features = np.zeros((num_nodes, 3))  # 预分配数组空间
+        for i, node in enumerate(nodes):
+            node_features[i] = np.array([
+                node.get('remain_cpu', 0.0),
+                node.get('remain_memory', 0.0),
+                node.get('out_edge_count', 0.0),
+            ], dtype=np.float32)
+        x = torch.from_numpy(node_features).to(torch.float32)
+
+        # Min-Max归一化（避免量纲问题）
+        x = (x - x.min(dim=0)[0]) / (x.max(dim=0)[0] - x.min(dim=0)[0] + 1e-6)
+
+        # 2. 构建PyG格式的边索引（[2, num_edges]）
+        edges = self.resource_graph.edges
+        edge_index = []
+        edge_weights = []
+        for edge in edges:
+            src = edge.get('src', 0)
+            dst = edge.get('dst', 0)
+            weight = edge.get('weight', 0.0)
+            if src < num_nodes and dst < num_nodes:
+                edge_index.append([src, dst])
+                edge_weights.append(weight)
+                edge_index.append([dst, src])  # 无向图双向添加
+                edge_weights.append(weight)
+        # 转换为PyTorch张量（PyG标准格式）
+        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous() if edge_index else torch.empty((2, 0), dtype=torch.long)
+        edge_weights = torch.tensor(edge_weights, dtype=torch.float32) if edge_weights else torch.empty(0, dtype=torch.float32)
+
+        # 3. 封装为PyG Data并移到指定设备
+        pyg_data = Data(x=x, edge_index=edge_index, edge_attr=edge_weights)
+        pyg_data = pyg_data.to(self.device)
+        return pyg_data
+
+    # 保留原有接口，仅替换内部实现（核心修改点3：兼容原有调用方式）
     def encode_resource_graph(self):
         nodes = self.resource_graph.nodes
         if not nodes:
-            self.Z_R = np.zeros(8)
+            self.Z_R = np.zeros(self.gnn_hidden_dim)
             return self.Z_R
-            
-        features = []
-        for node in nodes:
-            feature = np.array([
-                node.get('total_cpu', 0),
-                node.get('total_memory', 0),
-                node.get('out_edge_count', 0),
-                node.get('out_bandwidth', 0),
-                node.get('out_latency', 0)
-            ])
-            features.append(feature)
-            
-        features = np.array(features)
-        
-        aggregated = np.mean(features, axis=0)
-        
-        self.Z_R = aggregated
+
+        # 1. 转换为PyG数据格式
+        pyg_data = self._convert_to_pyg_data()
+
+        # 2. 用PyG的GAT模型计算节点嵌入（禁用梯度，提升速度）
+        with torch.no_grad():
+            node_embeddings = self.gat_model(pyg_data.x, pyg_data.edge_index, pyg_data.edge_attr)
+
+        # 3. 聚合为图嵌入（加权平均，基于节点度）
+        # 计算节点度（连接数）
+        node_degree = torch.bincount(pyg_data.edge_index[0], minlength=len(nodes))
+        node_degree = node_degree / node_degree.sum()  # 归一化权重
+        # 加权聚合
+        graph_embedding = (node_embeddings * node_degree.unsqueeze(1)).sum(dim=0)
+
+        # 转换为numpy格式（和你原来的输出类型保持一致）
+        self.Z_R = graph_embedding.cpu().numpy()
+
         return self.Z_R
-        
-    def generate_task_features(self, service):
+
+    # 为每个任务（service）生成特征向量，同时评估任务与资源节点匹配的可行性
+    def generate_task_features(self, task):
         if self.Z_R is None:
             self.encode_resource_graph()
             
-        cpu_demand = service.get('cpu_demand', service.get('total_cpu', 1))
-        memory_demand = service.get('memory_demand', service.get('total_memory', 1))
+        cpu_demand = task.get('cpu_demand', task.get('total_cpu', 1))
+        memory_demand = task.get('memory_demand', task.get('total_memory', 1))
         
         resource_match = 0
         feasible_neighbors = []
@@ -108,7 +213,7 @@ class ResourceAwareTaskGraphGenerator:
         return filtered_edges
         
     def encode_task_graph(self, task_graph):
-        services = task_graph.services
+        services = task_graph.tasks
         if not services:
             self.Z_T = np.zeros(8)
             return self.Z_T
@@ -152,7 +257,7 @@ class ResourceAwareTaskGraphGenerator:
         return decoded
         
     def evaluate_deployment(self, task_graph):
-        if not self.resource_graph or not task_graph.services:
+        if not self.resource_graph or not task_graph.tasks:
             return {
                 'R_success': 0.0,
                 'T_latency': 0.0,
@@ -160,8 +265,8 @@ class ResourceAwareTaskGraphGenerator:
                 'match_score': 0.0
             }
             
-        total_cpu_demand = sum(s.get('cpu_demand', 0) for s in task_graph.services)
-        total_mem_demand = sum(s.get('memory_demand', 0) for s in task_graph.services)
+        total_cpu_demand = sum(s.get('cpu_demand', 0) for s in task_graph.tasks)
+        total_mem_demand = sum(s.get('memory_demand', 0) for s in task_graph.tasks)
         
         total_cpu_capacity = sum(n.get('total_cpu', 0) for n in self.resource_graph.nodes)
         total_mem_capacity = sum(n.get('total_memory', 0) for n in self.resource_graph.nodes)
@@ -261,11 +366,11 @@ class ResourceAwareTaskGraphGenerator:
         
         if metrics['cpu_utilization'] > 1.0 or metrics['memory_utilization'] > 1.0:
             scale_factor = min(0.7, min(total_cpu_capacity, total_mem_capacity) / max(
-                sum(s.get('cpu_demand', 0) for s in task_graph.services),
-                sum(s.get('memory_demand', 0) for s in task_graph.services)
+                sum(s.get('cpu_demand', 0) for s in task_graph.tasks),
+                sum(s.get('memory_demand', 0) for s in task_graph.tasks)
             ) * 0.9)
             
-            for service in task_graph.services:
+            for service in task_graph.tasks:
                 service['cpu_demand'] = max(1.0, service['cpu_demand'] * scale_factor)
                 service['memory_demand'] = max(64.0, service['memory_demand'] * scale_factor)
                 
@@ -294,7 +399,7 @@ class ResourceAwareTaskGraphGenerator:
 class TaskTopologyGraph:
     def __init__(self, data):
         self.data = data
-        self.services = []
+        self.tasks = []
         self.edges = []
         self.dependency_matrix = None
         self.communication_matrix = None
@@ -309,7 +414,7 @@ class TaskTopologyGraph:
         
     def _build_services(self):
         for task_id, task in self.data.task_nodes.items():
-            self.services.append({
+            self.tasks.append({
                 'id': task.id,
                 'cpu_demand': task.cpu_demand,
                 'memory_demand': task.memory_demand,
@@ -336,10 +441,10 @@ class TaskTopologyGraph:
                 })
                 
     def _build_matrices(self):
-        n = len(self.services)
+        n = len(self.tasks)
         if n == 0:
             return
-            
+
         self.communication_matrix = np.zeros((n, n))
         for edge in self.edges:
             src_idx = edge['src'] - 1
@@ -351,8 +456,8 @@ class TaskTopologyGraph:
         self.dependency_matrix = (self.communication_matrix > 0).astype(int)
         
     def get_service_feature(self, service_id):
-        if service_id < len(self.services):
-            service = self.services[service_id]
+        if service_id < len(self.tasks):
+            service = self.tasks[service_id]
             return np.array([
                 service['cpu_demand'],
                 service['memory_demand'],
@@ -362,7 +467,7 @@ class TaskTopologyGraph:
         
     def get_all_service_features(self):
         features = []
-        for service in self.services:
+        for service in self.tasks:
             features.append([
                 service['cpu_demand'],
                 service['memory_demand'],
@@ -388,15 +493,15 @@ class TaskTopologyGraph:
         return self._service_resources.get(service_id, {'cpu': 0, 'memory': 0})
         
     def get_service_count(self):
-        return len(self.services)
+        return len(self.tasks)
         
     def get_topology_stats(self):
         return {
-            'service_count': len(self.services),
+            'service_count': len(self.tasks),
             'edge_count': len(self.edges),
-            'avg_degree': np.mean([len(s['dependencies']) for s in self.services]) if self.services else 0,
+            'avg_degree': np.mean([len(s['dependencies']) for s in self.tasks]) if self.tasks else 0,
             'total_communication': self.get_total_communication_weight(),
-            'density': len(self.edges) / max(1, len(self.services) * (len(self.services) - 1))
+            'density': len(self.edges) / max(1, len(self.tasks) * (len(self.tasks) - 1))
         }
 
 
@@ -459,7 +564,7 @@ class TaskTopologyGraph:
         self.edges = new_edges
         
     def _increase_service_resources(self, scale_factor):
-        for service in self.services:
+        for service in self.tasks:
             service['cpu_demand'] *= scale_factor
             service['memory_demand'] *= scale_factor
             self._service_resources[service['id']] = {
@@ -468,7 +573,7 @@ class TaskTopologyGraph:
             }
             
     def _decrease_service_resources(self, scale_factor):
-        for service in self.services:
+        for service in self.tasks:
             service['cpu_demand'] = max(0.01, service['cpu_demand'] * scale_factor)
             service['memory_demand'] = max(0.01, service['memory_demand'] * scale_factor)
             self._service_resources[service['id']] = {
@@ -490,7 +595,7 @@ class TaskTopologyGraph:
         self.edges = new_edges
         
     def _rebalance_topology(self, target_balance):
-        for service in self.services:
+        for service in self.tasks:
             load = service['cpu_demand'] + service['memory_demand']
             if load > 2 * target_balance:
                 scale = target_balance / load
@@ -510,7 +615,7 @@ class TaskTopologyGraph:
                 }
                 
     def _fine_tune_resources(self, scale_factor):
-        for service in self.services:
+        for service in self.tasks:
             service['cpu_demand'] *= scale_factor
             service['memory_demand'] *= scale_factor
             self._service_resources[service['id']] = {
@@ -525,11 +630,11 @@ class TaskTopologyGraph:
         pass
         
     def _split_critical_tasks(self, latency_threshold, success_threshold):
-        if not self.services:
+        if not self.tasks:
             return
             
         critical_tasks = []
-        for service in self.services:
+        for service in self.tasks:
             latency = 0
             for edge in self.edges:
                 if edge['src'] == service['id'] or edge['dst'] == service['id']:
@@ -556,21 +661,21 @@ class TaskTopologyGraph:
             }
             
             sub_task_2 = {
-                'id': len(self.services),
+                'id': len(self.tasks),
                 'cpu_demand': original_cpu / 2,
                 'memory_demand': original_memory / 2,
-                'dependencies': [{'src': original_id, 'dst': len(self.services), 'bandwidth': 10, 'latency': 5}]
+                'dependencies': [{'src': original_id, 'dst': len(self.tasks), 'bandwidth': 10, 'latency': 5}]
             }
             
-            for service in self.services:
+            for service in self.tasks:
                 if service['id'] == original_id:
                     for dep in service['dependencies']:
                         if dep['src'] == original_id:
                             sub_task_2['dependencies'].append(dep)
             
-            self.services = [s for s in self.services if s['id'] != original_id]
-            self.services.append(sub_task_1)
-            self.services.append(sub_task_2)
+            self.tasks = [s for s in self.tasks if s['id'] != original_id]
+            self.tasks.append(sub_task_1)
+            self.tasks.append(sub_task_2)
             
             self._service_resources[sub_task_1['id']] = {
                 'cpu': sub_task_1['cpu_demand'],
@@ -595,13 +700,13 @@ class TaskTopologyGraph:
             })
             
     def _merge_neighboring_tasks(self, comm_cost_threshold):
-        if len(self.services) < 2:
+        if len(self.tasks) < 2:
             return
             
-        for i in range(len(self.services)):
-            for j in range(i + 1, len(self.services)):
-                service_i = self.services[i]
-                service_j = self.services[j]
+        for i in range(len(self.tasks)):
+            for j in range(i + 1, len(self.tasks)):
+                service_i = self.tasks[i]
+                service_j = self.tasks[j]
                 
                 comm_cost = 0
                 for edge in self.edges:
@@ -630,8 +735,8 @@ class TaskTopologyGraph:
                                 'latency': dep.get('latency', 0)
                             })
                     
-                    self.services = [s for s in self.services if s['id'] not in [service_i['id'], service_j['id']]]
-                    self.services.append(merged_service)
+                    self.tasks = [s for s in self.tasks if s['id'] not in [service_i['id'], service_j['id']]]
+                    self.tasks.append(merged_service)
                     
                     self._service_resources[merged_service['id']] = {
                         'cpu': merged_service['cpu_demand'],
@@ -648,7 +753,7 @@ class TaskTopologyGraph:
                     break
                     
     def _adjust_task_priority(self, lambda1, lambda2):
-        for service in self.services:
+        for service in self.tasks:
             success_rate = service.get('success_rate', 0.9)
             latency = 0
             for edge in self.edges:
@@ -686,59 +791,59 @@ class TaskTopologyGraph:
             np.random.seed(seed)
             
         new_task_graph = TaskTopologyGraph(self.data)
-        new_task_graph.services = []
+        new_task_graph.tasks = []
         new_task_graph._service_resources = {}
         
         if variation_type == 'random':
-            for i, service in enumerate(self.services):
+            for i, service in enumerate(self.tasks):
                 cpu_var = np.random.uniform(0.8, 1.2)
                 mem_var = np.random.uniform(0.8, 1.2)
-                new_task_graph.services.append({
+                new_task_graph.tasks.append({
                     'id': i,
                     'cpu_demand': service['cpu_demand'] * cpu_var,
                     'memory_demand': service['memory_demand'] * mem_var,
                     'dependencies': service['dependencies'].copy()
                 })
                 new_task_graph._service_resources[i] = {
-                    'cpu': new_task_graph.services[-1]['cpu_demand'],
-                    'memory': new_task_graph.services[-1]['memory_demand']
+                    'cpu': new_task_graph.tasks[-1]['cpu_demand'],
+                    'memory': new_task_graph.tasks[-1]['memory_demand']
                 }
                 
         elif variation_type == 'scale_up':
-            for i, service in enumerate(self.services):
+            for i, service in enumerate(self.tasks):
                 scale = np.random.uniform(1.0, 1.5)
-                new_task_graph.services.append({
+                new_task_graph.tasks.append({
                     'id': i,
                     'cpu_demand': service['cpu_demand'] * scale,
                     'memory_demand': service['memory_demand'] * scale,
                     'dependencies': service['dependencies'].copy()
                 })
                 new_task_graph._service_resources[i] = {
-                    'cpu': new_task_graph.services[-1]['cpu_demand'],
-                    'memory': new_task_graph.services[-1]['memory_demand']
+                    'cpu': new_task_graph.tasks[-1]['cpu_demand'],
+                    'memory': new_task_graph.tasks[-1]['memory_demand']
                 }
                 
         elif variation_type == 'scale_down':
-            for i, service in enumerate(self.services):
+            for i, service in enumerate(self.tasks):
                 scale = np.random.uniform(0.5, 1.0)
-                new_task_graph.services.append({
+                new_task_graph.tasks.append({
                     'id': i,
                     'cpu_demand': max(0.01, service['cpu_demand'] * scale),
                     'memory_demand': max(0.01, service['memory_demand'] * scale),
                     'dependencies': service['dependencies'].copy()
                 })
                 new_task_graph._service_resources[i] = {
-                    'cpu': new_task_graph.services[-1]['cpu_demand'],
-                    'memory': new_task_graph.services[-1]['memory_demand']
+                    'cpu': new_task_graph.tasks[-1]['cpu_demand'],
+                    'memory': new_task_graph.tasks[-1]['memory_demand']
                 }
                 
         elif variation_type == 'topology_change':
-            new_task_graph.services = [{
+            new_task_graph.tasks = [{
                 'id': i,
                 'cpu_demand': s['cpu_demand'],
                 'memory_demand': s['memory_demand'],
                 'dependencies': s['dependencies'].copy()
-            } for i, s in enumerate(self.services)]
+            } for i, s in enumerate(self.tasks)]
             new_task_graph._service_resources = dict(self._service_resources)
             
             if len(self.edges) > 0:
@@ -760,12 +865,12 @@ class TaskTopologyGraph:
         
     def clone(self):
         new_graph = TaskTopologyGraph(self.data)
-        new_graph.services = [{
+        new_graph.tasks = [{
             'id': s['id'],
             'cpu_demand': s['cpu_demand'],
             'memory_demand': s['memory_demand'],
             'dependencies': s['dependencies'].copy()
-        } for s in self.services]
+        } for s in self.tasks]
         new_graph._service_resources = dict(self._service_resources)
         new_graph.edges = [{
             'src': e['src'],
@@ -777,7 +882,7 @@ class TaskTopologyGraph:
         return new_graph
         
     def __repr__(self):
-        return f"TaskGraph(services={len(self.services)}, edges={len(self.edges)})"
+        return f"TaskGraph(services={len(self.tasks)}, edges={len(self.edges)})"
 
 
 def test_resource_aware_generator():
@@ -811,7 +916,7 @@ def test_resource_aware_generator():
     print(f"  Shape: {Z_R.shape}")
     
     print("\n--- Test 2: Generate Task Features ---")
-    for i, service in enumerate(task_graph.services[:3]):
+    for i, service in enumerate(task_graph.tasks[:3]):
         task_embedding, feasible_neighbors = generator.generate_task_features(service)
         print(f"  Task {i}:")
         print(f"    Embedding: {task_embedding}")
@@ -875,7 +980,7 @@ def test_resource_aware_generator():
     optimized_metrics = generator.evaluate_deployment(optimized_graph)
     
     print(f"  Original Task Graph:")
-    print(f"    Services: {len(task_graph.services)}, Edges: {len(task_graph.edges)}")
+    print(f"    Services: {len(task_graph.tasks)}, Edges: {len(task_graph.edges)}")
     print(f"    R_success: {original_metrics['R_success']:.4f}")
     print(f"    T_latency: {original_metrics['T_latency']:.2f} ms")
     print(f"    Match score: {original_metrics['match_score']:.4f}")
@@ -915,7 +1020,7 @@ def test_task_graph():
     print(f"\n{task_graph}")
     
     print("\n--- Services ---")
-    for i, service in enumerate(task_graph.services):
+    for i, service in enumerate(task_graph.tasks):
         print(f"  Task {i}: cpu={service['cpu_demand']}, mem={service['memory_demand']}, deps={len(service['dependencies'])}")
     
     print("\n--- Dependencies ---")
@@ -947,7 +1052,7 @@ def test_task_graph():
     }
     task_graph.adjust_topology(feedback1)
     print(f"After split: {task_graph}")
-    print(f"  Services: {len(task_graph.services)}")
+    print(f"  Services: {len(task_graph.tasks)}")
     print(f"  Edges: {len(task_graph.edges)}")
     
     task_graph = TaskTopologyGraph(data)
@@ -960,7 +1065,7 @@ def test_task_graph():
     }
     task_graph.adjust_topology(feedback2)
     print(f"After merge: {task_graph}")
-    print(f"  Services: {len(task_graph.services)}")
+    print(f"  Services: {len(task_graph.tasks)}")
     print(f"  Edges: {len(task_graph.edges)}")
     
     task_graph = TaskTopologyGraph(data)
@@ -974,7 +1079,7 @@ def test_task_graph():
     }
     task_graph.adjust_topology(feedback3)
     print(f"After priority adjust: {task_graph}")
-    for i, service in enumerate(task_graph.services):
+    for i, service in enumerate(task_graph.tasks):
         priority = service.get('priority', 'N/A')
         print(f"  Task {i} priority: {priority}")
     
@@ -999,7 +1104,7 @@ def test_task_graph():
     variation = task_graph.generate_variation('random', seed=42)
     print(f"Original: {task_graph}")
     print(f"Variation: {variation}")
-    for i, service in enumerate(variation.services):
+    for i, service in enumerate(variation.tasks):
         print(f"  Task {i}: cpu={service['cpu_demand']:.2f}, mem={service['memory_demand']:.2f}")
     
     print("\n--- Test 6: Clone ---")
@@ -1011,8 +1116,38 @@ def test_task_graph():
     print("Test Complete!")
     print("="*60)
 
+def test_Z_R():
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+    from dataSet.data import Data
+    from resource_graph import ResourceTopologyGraph
+
+    print("=" * 70)
+    print("ResourceAwareTaskGraphGenerator Test")
+    print("=" * 70)
+
+    data = Data('dataSet/data.xml')
+    resource_graph = ResourceTopologyGraph(data)
+    resource_graph.build_from_data()
+
+    print(f"\nResource Graph: {resource_graph}")
+    print(f"  Nodes: {resource_graph.get_node_count()}")
+
+    task_graph = TaskTopologyGraph(data)
+    task_graph.build_from_data()
+    print(f"Task Graph: {task_graph}")
+
+    generator = ResourceAwareTaskGraphGenerator(resource_graph, data)
+
+    print("\n--- Test 1: Encode Resource Graph ---")
+    Z_R = generator.encode_resource_graph()
+    print(f"  Z_R (resource embedding): {Z_R}")
+    print(f"  Shape: {Z_R.shape}")
 
 if __name__ == '__main__':
-    test_task_graph()
-    print("\n\n")
-    test_resource_aware_generator()
+    # test_task_graph()
+    # print("\n\n")
+    # test_resource_aware_generator()
+    test_Z_R()
