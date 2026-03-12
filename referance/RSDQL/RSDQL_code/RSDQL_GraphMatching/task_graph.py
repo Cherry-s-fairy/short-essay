@@ -2,14 +2,11 @@
 
 import numpy as np
 import random
-import torch
-import torch.nn.functional as F
-from torch_geometric.data import Data
-from torch_geometric.nn import GATConv
+from gat_encoder import GATEncoder
 
 
 class ResourceAwareTaskGraphGenerator:
-    def __init__(self, resource_graph, data=None):
+    def __init__(self, resource_graph, data=None, use_pyg=False):
         self.resource_graph = resource_graph
         self.data = data
         self.Z_R = None
@@ -19,128 +16,27 @@ class ResourceAwareTaskGraphGenerator:
         self.convergence_threshold = 0.05
         self.history = []
 
-        # GAT参数
         self.gnn_hidden_dim = 32
         self.gnn_num_layers = 3
         self.num_heads = 4
-        self.dropout = 0.1
-
-        # 初始化PyG的GAT模型（核心修改点1：替换手动GAT为PyG的GATConv）
-        self.gat_model = self._build_gat_model()
-        # 设置为推理模式（默认不训练，如需训练可改为train()）
-        self.gat_model.eval()
-
-        # 设备选择（自动选择GPU/CPU）
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.gat_model = self.gat_model.to(self.device)
-
-    # 构建PyG的GAT模型（核心：多层GATConv）
-    def _build_gat_model(self):
-        class GATEncoder(torch.nn.Module):
-            def __init__(self, input_dim=7, hidden_dim=32, num_layers=3, num_heads=4, dropout=0.1):
-                super().__init__()
-                self.gat_layers = torch.nn.ModuleList()
-                self.dropout = dropout
-                # 第一层：输入维度→隐藏维度（多头拼接）
-                self.gat_layers.append(
-                    GATConv(input_dim, hidden_dim // num_heads, heads=num_heads, dropout=dropout, edge_dim=1)
-                )
-                # 中间层：隐藏维度→隐藏维度（多头拼接）
-                for _ in range(num_layers - 2):
-                    self.gat_layers.append(
-                        GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads, dropout=dropout)
-                    )
-                # 最后一层：隐藏维度→隐藏维度（单头平均）
-                self.gat_layers.append(
-                    GATConv(hidden_dim, hidden_dim, heads=1, concat=False, dropout=dropout)
-                )
-
-            # 前向传播：节点特征 → 多层GAT → 节点嵌入
-            def forward(self, x, edge_index, edge_attr):
-                h = x
-                for i, layer in enumerate(self.gat_layers):
-                    h = layer(h, edge_index, edge_attr=edge_attr)
-                    if i != len(self.gat_layers) - 1:
-                        h = F.relu(h)
-                        h = F.dropout(h, p=self.dropout, training=self.training)
-                return h
-
-        # 实例化GAT模型
-        model = GATEncoder(
-            input_dim=3,
+        
+        self.gat_encoder = GATEncoder(
             hidden_dim=self.gnn_hidden_dim,
             num_layers=self.gnn_num_layers,
             num_heads=self.num_heads,
-            dropout=self.dropout
+            use_pyg=use_pyg
         )
-        return model
 
-    # 将自定义resource_graph转换为PyG的Data格式
-    def _convert_to_pyg_data(self):
-        nodes = self.resource_graph.nodes
-        num_nodes = len(nodes)
-        if num_nodes == 0:
-            return None
-
-        # 1. 提取并归一化节点特征
-        node_features = np.zeros((num_nodes, 3))  # 预分配数组空间
-        for i, node in enumerate(nodes):
-            node_features[i] = np.array([
-                node.get('remain_cpu', 0.0),
-                node.get('remain_memory', 0.0),
-                node.get('out_edge_count', 0.0),
-            ], dtype=np.float32)
-        x = torch.from_numpy(node_features).to(torch.float32)
-
-        # Min-Max归一化（避免量纲问题）
-        x = (x - x.min(dim=0)[0]) / (x.max(dim=0)[0] - x.min(dim=0)[0] + 1e-6)
-
-        # 2. 构建PyG格式的边索引（[2, num_edges]）
-        edges = self.resource_graph.edges
-        edge_index = []
-        edge_weights = []
-        for edge in edges:
-            src = edge.get('src', 0)
-            dst = edge.get('dst', 0)
-            weight = edge.get('weight', 0.0)
-            if src < num_nodes and dst < num_nodes:
-                edge_index.append([src, dst])
-                edge_weights.append(weight)
-                edge_index.append([dst, src])  # 无向图双向添加
-                edge_weights.append(weight)
-        # 转换为PyTorch张量（PyG标准格式）
-        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous() if edge_index else torch.empty((2, 0), dtype=torch.long)
-        edge_weights = torch.tensor(edge_weights, dtype=torch.float32) if edge_weights else torch.empty(0, dtype=torch.float32)
-
-        # 3. 封装为PyG Data并移到指定设备
-        pyg_data = Data(x=x, edge_index=edge_index, edge_attr=edge_weights)
-        pyg_data = pyg_data.to(self.device)
-        return pyg_data
-
-    # 保留原有接口，仅替换内部实现（核心修改点3：兼容原有调用方式）
     def encode_resource_graph(self):
         nodes = self.resource_graph.nodes
+        edges = self.resource_graph.edges if hasattr(self.resource_graph, 'edges') else []
+        
         if not nodes:
             self.Z_R = np.zeros(self.gnn_hidden_dim)
             return self.Z_R
-
-        # 1. 转换为PyG数据格式
-        pyg_data = self._convert_to_pyg_data()
-
-        # 2. 用PyG的GAT模型计算节点嵌入（禁用梯度，提升速度）
-        with torch.no_grad():
-            node_embeddings = self.gat_model(pyg_data.x, pyg_data.edge_index, pyg_data.edge_attr)
-
-        # 3. 聚合为图嵌入（加权平均，基于节点度）
-        # 计算节点度（连接数）
-        node_degree = torch.bincount(pyg_data.edge_index[0], minlength=len(nodes))
-        node_degree = node_degree / node_degree.sum()  # 归一化权重
-        # 加权聚合
-        graph_embedding = (node_embeddings * node_degree.unsqueeze(1)).sum(dim=0)
-
-        # 转换为numpy格式（和你原来的输出类型保持一致）
-        self.Z_R = graph_embedding.cpu().numpy()
-
+        
+        self.Z_R = self.gat_encoder.encode(nodes, edges)
+        
         return self.Z_R
 
     # 为每个任务（service）生成特征向量，同时评估任务与资源节点匹配的可行性
