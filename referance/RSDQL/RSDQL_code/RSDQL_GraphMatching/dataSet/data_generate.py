@@ -22,6 +22,9 @@ def task_random_memory():
 def task_random_cpu():
     return random.choice([0.5, 1, 1.5, 2, 2.5])
 
+def task_random_priority():
+    return random.choice([1, 2, 3, 4, 5])  # Mbps
+
 def task_random_bandwidth():
     return random.choice([20, 40, 60, 80])  # Mbps
 
@@ -78,6 +81,7 @@ def generate_task_nodes(count):
         ET.SubElement(node, "Id").text = str(i)
         ET.SubElement(node, "CPU").text = str(task_random_cpu())
         ET.SubElement(node, "Memory").text = str(task_random_memory())
+        ET.SubElement(node, "Priority").text = str(task_random_priority())
         nodes.append(node)
     return nodes
 

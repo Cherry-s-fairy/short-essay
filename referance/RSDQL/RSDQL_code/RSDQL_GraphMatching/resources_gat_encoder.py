@@ -4,7 +4,7 @@ import numpy as np
 import os
 
 
-class GATEncoder:
+class ResourcesGATEncoder:
     def __init__(self, hidden_dim=32, num_layers=3, num_heads=4, use_pyg=False):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -279,14 +279,14 @@ def test_gat_encoder():
     print(f"  Nodes: {resource_graph.get_node_count()}")
     
     print("Testing NumPy GAT Encoder:")
-    encoder = GATEncoder(hidden_dim=32, num_layers=3, num_heads=4, use_pyg=False)
+    encoder = ResourcesGATEncoder(hidden_dim=32, num_layers=3, num_heads=4, use_pyg=False)
     embedding = encoder.encode(resource_graph.nodes, resource_graph.edges)
     print(f"  Embedding shape: {embedding.shape}")
     print(f"  Embedding: {embedding[:5]}...")
     
     print("\nTesting PyG GAT Encoder:")
     try:
-        encoder_pyg = GATEncoder(hidden_dim=32, num_layers=3, num_heads=4, use_pyg=True)
+        encoder_pyg = ResourcesGATEncoder(hidden_dim=32, num_layers=3, num_heads=4, use_pyg=True)
         embedding_pyg = encoder_pyg.encode(resource_graph.nodes, resource_graph.edges)
         print(f"  Embedding shape: {embedding_pyg.shape}")
         print(f"  Embedding: {embedding_pyg}")

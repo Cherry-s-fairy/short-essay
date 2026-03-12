@@ -49,7 +49,8 @@ class Data:
             node_id = int(node_elem.find('Id').text)
             cpu_demand = float(node_elem.find('CPU').text)
             memory_demand = float(node_elem.find('Memory').text)
-            self.task_nodes[node_id] = Task(node_id, cpu_demand, memory_demand)
+            priority = int(node_elem.find('Priority').text)
+            self.task_nodes[node_id] = Task(node_id, cpu_demand, memory_demand, priority)
 
         nodeEdge = tasknode.find('nodeEdge')
         if nodeEdge is not None:
@@ -98,10 +99,11 @@ class UAV:
 
 
 class Task:
-    def __init__(self, task_id, cpu_demand, memory_demand):
+    def __init__(self, task_id, cpu_demand, memory_demand, priority):
         self.id = task_id
         self.cpu_demand = cpu_demand
         self.memory_demand = memory_demand
+        self.priority = priority
         self.src_edges = []
         self.dependencies = []
         self.node = 0
@@ -127,7 +129,7 @@ class Task:
         })
 
     def __repr__(self):
-        return f"Task(id={self.id}, cpu={self.cpu_demand:.2f}, mem={self.memory_demand:.2f}, src_edges={self.src_edges}, dependencies={self.dependencies}, node={self.node})"
+        return f"Task(id={self.id}, cpu={self.cpu_demand:.2f}, mem={self.memory_demand:.2f}, priority={self.priority}, src_edges={self.src_edges}, dependencies={self.dependencies}, node={self.node})"
 
 
 class Edge:

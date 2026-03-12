@@ -2,7 +2,8 @@
 
 import numpy as np
 import random
-from gat_encoder import GATEncoder
+from resources_gat_encoder import ResourcesGATEncoder
+from tasks_gat_encoder import TasksGATEncoder
 
 
 class ResourceAwareTaskGraphGenerator:
@@ -20,13 +21,21 @@ class ResourceAwareTaskGraphGenerator:
         self.gnn_num_layers = 3
         self.num_heads = 4
         
-        self.gat_encoder = GATEncoder(
+        self.resources_gat_encoder = ResourcesGATEncoder(
             hidden_dim=self.gnn_hidden_dim,
             num_layers=self.gnn_num_layers,
             num_heads=self.num_heads,
             use_pyg=use_pyg
         )
 
+        self.tasks_gat_encoder = TasksGATEncoder(
+            hidden_dim=self.gnn_hidden_dim,
+            num_layers=self.gnn_num_layers,
+            num_heads=self.num_heads,
+            use_pyg=use_pyg
+        )
+
+    # gat对资源图编码
     def encode_resource_graph(self):
         nodes = self.resource_graph.nodes
         edges = self.resource_graph.edges if hasattr(self.resource_graph, 'edges') else []
@@ -35,7 +44,7 @@ class ResourceAwareTaskGraphGenerator:
             self.Z_R = np.zeros(self.gnn_hidden_dim)
             return self.Z_R
         
-        self.Z_R = self.gat_encoder.encode(nodes, edges)
+        self.Z_R = self.resources_gat_encoder.encode(nodes, edges)
         
         return self.Z_R
 
@@ -44,16 +53,16 @@ class ResourceAwareTaskGraphGenerator:
         if self.Z_R is None:
             self.encode_resource_graph()
             
-        cpu_demand = task.get('cpu_demand', task.get('total_cpu', 1))
-        memory_demand = task.get('memory_demand', task.get('total_memory', 1))
+        cpu_demand = task.get('cpu_demand', 0)
+        memory_demand = task.get('memory_demand', 0)
         
         resource_match = 0
         feasible_neighbors = []
         
         if len(self.resource_graph.nodes) > 0:
             for i, node in enumerate(self.resource_graph.nodes):
-                cpu_capacity = node.get('total_cpu', 0)
-                mem_capacity = node.get('total_memory', 0)
+                cpu_capacity = node.get('remain_cpu', 0)
+                mem_capacity = node.get('remain_memory', 0)
                 
                 if cpu_demand <= cpu_capacity and memory_demand <= mem_capacity:
                     feasible_neighbors.append(i)
@@ -71,6 +80,10 @@ class ResourceAwareTaskGraphGenerator:
             self.Z_R[0] if len(self.Z_R) > 0 else 0,
             self.Z_R[1] if len(self.Z_R) > 1 else 0
         ])
+
+        # 将资源匹配特征挂载到任务对象，供GAT编码使用
+        task['feasible_nodes'] = len(feasible_neighbors)
+        task['resource_match'] = resource_match
         
         return task_embedding, feasible_neighbors
         
@@ -79,63 +92,54 @@ class ResourceAwareTaskGraphGenerator:
             return edges
             
         filtered_edges = []
+        max_data_size = 1024  # 假设最大传输量为1024MB
+        alpha = 0.8  # 数据量权重系数，可配置
         
         for edge in edges:
-            src = edge.get('src', 0)
-            dst = edge.get('dst', 0)
+            src = edge.get('src', 1) - 1
+            dst = edge.get('dst', 1) - 1
             bandwidth = edge.get('bandwidth', 0)
             latency = edge.get('latency', 0)
-            
-            if src > 0 and dst > 0:
-                src_idx = src - 1
-                dst_idx = dst - 1
-                
-                if src_idx < self.resource_graph.get_node_count() and dst_idx < self.resource_graph.get_node_count():
-                    path_distance = self.resource_graph.get_shortest_path_distance(src_idx, dst_idx)
-                    
-                    if path_distance < float('inf') and path_distance > 0:
-                        comm_feasibility = bandwidth / (path_distance + 1)
-                        
-                        if comm_feasibility > 0.1:
-                            edge['comm_feasibility'] = comm_feasibility
-                            filtered_edges.append(edge)
-                    else:
-                        filtered_edges.append(edge)
-                else:
+            loss = edge.get('loss', 0)
+            data = edge.get('data', 0)
+
+            comm_feasibility = 0.0
+            if 0 <= src < self.resource_graph.get_node_count() and 0 <= dst < self.resource_graph.get_node_count():
+                path_distance = self.resource_graph.get_shortest_path_distance(src, dst)
+
+                if path_distance < float('inf') and path_distance > 0:
+                    # 处理丢包率（限制在[0, 1]，避免异常值）
+                    loss = max(0.0, min(1.0, loss))
+                    loss_correction = 1 - loss  # 丢包率越高，修正系数越小
+                    # 处理数据传输量（归一化 + 惩罚项）
+                    norm_data_size = min(data / max_data_size, 1.0)  # 归一化到[0,1]
+                    data_penalty = alpha * norm_data_size  # 数据量越大，惩罚越重
+                    # 加入延迟因子，更合理的通信可行性计算
+                    denominator = path_distance + latency + data_penalty + 1e-6
+                    comm_feasibility = (bandwidth * loss_correction) / denominator
+                    comm_feasibility = min(comm_feasibility, 1.0)  # 归一化到[0,1]
+
+                if comm_feasibility > 0.1:
+                    edge['comm_feasibility'] = comm_feasibility
                     filtered_edges.append(edge)
-            else:
-                filtered_edges.append(edge)
-                
+
         return filtered_edges
         
     def encode_task_graph(self, task_graph):
-        services = task_graph.tasks
-        if not services:
-            self.Z_T = np.zeros(8)
+        tasks = task_graph.tasks
+        if not tasks:
+            self.Z_T = np.zeros(self.gnn_hidden_dim)  # 改为GAT隐藏维度
             return self.Z_T
             
         features = []
-        for service in services:
-            feature = np.array([
-                service.get('cpu_demand', 0),
-                service.get('memory_demand', 0),
-                len(service.get('dependencies', [])),
-                service.get('priority', 0.5)
-            ])
+        for task in tasks:
+            feature, _ = self.generate_task_features(task)
             features.append(feature)
-            
-        if features:
-            features = np.array(features)
-            aggregated = np.mean(features, axis=0)
-            
-            if len(aggregated) < 8:
-                aggregated = np.pad(aggregated, (0, 8 - len(aggregated)))
-            else:
-                aggregated = aggregated[:8]
-        else:
-            aggregated = np.zeros(8)
-            
-        self.Z_T = aggregated
+
+        edges = task_graph.edges if hasattr(task_graph, 'edges') else []
+        filtered_edges = self.filter_dependency_edges(edges, resource_aware=True)
+
+        self.Z_T = self.tasks_gat_encoder.encode(features, filtered_edges)
         return self.Z_T
         
     def decode_combined_embedding(self):
@@ -314,6 +318,7 @@ class TaskTopologyGraph:
                 'id': task.id,
                 'cpu_demand': task.cpu_demand,
                 'memory_demand': task.memory_demand,
+                'priority': task.priority,
                 'dependencies': task.dependencies.copy()
             }) 
             self._service_resources[task.id] = {
