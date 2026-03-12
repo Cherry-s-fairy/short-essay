@@ -94,21 +94,24 @@ class GATEncoder:
         edge_index = [[], []]
         edge_weights = []
         for edge in edges:
-            src = edge.get('src', 0)
-            dst = edge.get('dst', 0)
+            src = edge.get('src', 1)
+            dst = edge.get('dst', 1)
             weight = edge.get('weight', 0.0)
-            if src < num_nodes and dst < num_nodes:
-                edge_index[0].append(src)
-                edge_index[1].append(dst)
+            if 1 <= src <= num_nodes and 1 <= dst <= num_nodes:
+                edge_index[0].append(src-1)
+                edge_index[1].append(dst-1)
                 edge_weights.append(weight)
-                edge_index[0].append(dst)
-                edge_index[1].append(src)
+                edge_index[0].append(dst-1)
+                edge_index[1].append(src-1)
                 edge_weights.append(weight)
-        for i in range(1, num_nodes + 1):
-            edge_index.append((i, i))
-            edge_weights.append(1.0)
-        edge_index = np.array(edge_index) if edge_index[0] else np.array([[], []])
-        edge_weights = np.array(edge_weights, dtype=np.float32) if edge_weights else np.array([])
+        if num_nodes > 0:
+            for i in range(num_nodes):
+                    edge_index[0].append(i)
+                    edge_index[1].append(i)
+                    edge_weights.append(1.0)
+        edge_index = np.array(edge_index, dtype=np.int64) if edge_index[0] else np.array([[], []], dtype=np.int64)
+        edge_weights = np.array(edge_weights, dtype=np.float32) if edge_weights else np.array([], dtype=np.float32)
+
         return edge_index, edge_weights
     
     def _normalize_features(self, features):
