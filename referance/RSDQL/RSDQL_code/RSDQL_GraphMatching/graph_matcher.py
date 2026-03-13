@@ -25,7 +25,7 @@ class GraphMatcher:
         return self.mapping
         
     def _calculate_node_similarity(self, service_id, node_id):
-        service_feature = self.task_graph.get_service_feature(service_id)
+        service_feature = self.task_graph.get_task_feature(service_id)
         node_feature = self.resource_graph.get_node_feature(node_id)
         
         if service_id < len(self.task_graph.tasks):
@@ -71,7 +71,7 @@ class GraphMatcher:
         return total_similarity / count if count > 0 else 0.0
         
     def _build_cost_matrix(self):
-        n_services = self.task_graph.get_service_count()
+        n_services = self.task_graph.get_task_count()
         n_nodes = self.resource_graph.get_node_count()
         
         if n_services == 0 or n_nodes == 0:
@@ -100,13 +100,13 @@ class GraphMatcher:
         
         mapping = {}
         for i, j in zip(row_ind, col_ind):
-            if i < self.task_graph.get_service_count() and j < self.resource_graph.get_node_count():
+            if i < self.task_graph.get_task_count() and j < self.resource_graph.get_node_count():
                 mapping[i] = j
             
         return mapping
         
     def _greedy_matching(self):
-        n_services = self.task_graph.get_service_count()
+        n_services = self.task_graph.get_task_count()
         n_nodes = self.resource_graph.get_node_count()
         
         if n_services > n_nodes:
@@ -143,7 +143,7 @@ class GraphMatcher:
         return self._hungarian_matching()
         
     def _heuristic_matching(self):
-        n_services = self.task_graph.get_service_count()
+        n_services = self.task_graph.get_task_count()
         n_nodes = self.resource_graph.get_node_count()
         
         if n_services > n_nodes:
@@ -195,7 +195,7 @@ class GraphMatcher:
         if not self.mapping:
             return False, "No mapping available"
             
-        n_services = self.task_graph.get_service_count()
+        n_services = self.task_graph.get_task_count()
         n_nodes = self.resource_graph.get_node_count()
         
         if len(self.mapping) != n_services:
@@ -205,7 +205,7 @@ class GraphMatcher:
             return False, "Duplicate node assignment"
             
         for service_id, node_id in self.mapping.items():
-            service_demand = self.task_graph.get_service_resource_demand(service_id)
+            service_demand = self.task_graph.get_task_resource_demand(service_id)
             if node_id < len(self.resource_graph.nodes):
                 node_capacity = self.resource_graph.nodes[node_id]
                 

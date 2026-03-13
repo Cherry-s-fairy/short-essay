@@ -75,7 +75,7 @@ class ResourceAwareTaskGraphGenerator:
         
         return self.Z_R
 
-    # 为每个任务（service）生成特征向量，同时评估任务与资源节点匹配的可行性
+    # 为每个任务生成特征向量，同时评估任务与资源节点匹配的可行性
     def generate_task_features(self, task):
         if self.Z_R is None:
             self.encode_resource_graph()
@@ -257,7 +257,8 @@ class ResourceAwareTaskGraphGenerator:
             'cpu_utilization': round(cpu_util, 4),
             'memory_utilization': round(mem_util, 4)
         }
-        
+
+    # 单次「资源感知评估」（只计算、不优化）
     def generate_resource_aware_task_graph(self, task_graph):
         self.encode_resource_graph()
         
@@ -275,40 +276,40 @@ class ResourceAwareTaskGraphGenerator:
         })
         
         return task_graph, metrics
-        
+
+    # 任务图「迭代优化总控中心」
     def optimize_task_graph(self, task_graph):
         self.iteration = 0
         self.history = []
         
         original_graph = task_graph.clone()
-        
         total_cpu_capacity = sum(n.get('total_cpu', 0) for n in self.resource_graph.nodes)
         total_mem_capacity = sum(n.get('total_memory', 0) for n in self.resource_graph.nodes)
-        
         current_graph = original_graph.clone()
         
         while self.iteration < self.max_iterations:
             self.iteration += 1
             
-            current_graph, metrics = self.evaluate_with_adjustment(
-                current_graph.clone(), total_cpu_capacity, total_mem_capacity
-            )
-            
+            current_graph, metrics = self.evaluate_with_adjustment(current_graph.clone(), total_cpu_capacity, total_mem_capacity)
+
+            # 优先检查是否达到目标
+            if metrics.get('R_success', 0) >= 0.85 and metrics.get('T_latency', float('inf')) < 80:
+                break
+
+            # 检查收敛
             if len(self.history) >= 2:
                 prev_metrics = self.history[-2]['metrics']
                 curr_metrics = self.history[-1]['metrics']
                 
                 success_diff = abs(curr_metrics['R_success'] - prev_metrics['R_success'])
                 latency_diff = abs(curr_metrics['T_latency'] - prev_metrics['T_latency'])
-                
-                if success_diff < self.convergence_threshold and latency_diff < 1.0:
-                    break                    
-                    
-            if metrics['R_success'] >= 0.85 and metrics['T_latency'] < 80:
-                break                
+
+                if success_diff < self.convergence_threshold and latency_diff < 1:
+                    break
                 
         return current_graph, self.history
-        
+
+    # 「评估 + 自动修复」执行单元
     def evaluate_with_adjustment(self, task_graph, total_cpu_capacity, total_mem_capacity):
         self.encode_resource_graph()
         self.encode_task_graph(task_graph)
@@ -316,36 +317,41 @@ class ResourceAwareTaskGraphGenerator:
         metrics = self.evaluate_deployment(task_graph)
         
         adjusted = False
-        
-        if metrics['cpu_utilization'] > 1.0 or metrics['memory_utilization'] > 1.0:
-            scale_factor = min(0.7, min(total_cpu_capacity, total_mem_capacity) / max(
-                sum(s.get('cpu_demand', 0) for s in task_graph.tasks),
-                sum(s.get('memory_demand', 0) for s in task_graph.tasks)
-            ) * 0.9)
-            
-            for service in task_graph.tasks:
-                service['cpu_demand'] = max(1.0, service['cpu_demand'] * scale_factor)
-                service['memory_demand'] = max(64.0, service['memory_demand'] * scale_factor)
-                
-            adjusted = True
-            
-        elif metrics['T_latency'] > 50 and task_graph.edges:
-            feedback = {
-                'adjustment_type': 'split_high_latency',
-                'latency_threshold': 50
-            }
+        adjustment_info = None
+
+        # 资源超限调整
+        if metrics.get('cpu_utilization', 0) > 1.0 or metrics.get('memory_utilization', 0) > 1.0:
+            total_cpu_demand = sum(t.get('cpu_demand', 0) for t in task_graph.tasks)
+            total_mem_demand = sum(t.get('memory_demand', 0) for t in task_graph.tasks)
+            cpu_scale = total_cpu_capacity / total_cpu_demand if total_cpu_demand > 0 else 1.0
+            mem_scale = total_mem_capacity / total_mem_demand if total_mem_demand > 0 else 1.0
+            scale_factor = min(cpu_scale, mem_scale) * 0.9
+            scale_factor = max(scale_factor, 0.5)  # 避免过度压缩
+            for svc in task_graph.tasks:
+                svc['cpu_demand'] = max(1.0, svc.get('cpu_demand', 0) * scale_factor)
+                svc['memory_demand'] = max(64.0, svc.get('memory_demand', 0) * scale_factor)
+            adjusted, adjustment_info = True, 'scale_resources'
+
+            # 延迟过高调整
+        elif metrics.get('T_latency', 0) > 50 and hasattr(task_graph, 'edges') and task_graph.edges:
+            feedback = {'adjustment_type': 'split_high_latency', 'latency_threshold': 50}
             task_graph.adjust_topology(feedback)
-            adjusted = True
-            
+            adjusted, adjustment_info = True, 'split_high_latency'
+
+        # 若调整，重新编码并评估
         if adjusted:
+            self.encode_task_graph(task_graph)
+            decoded = self.decode_combined_embedding()
             metrics = self.evaluate_deployment(task_graph)
-            
+
+        # 记录历史
         self.history.append({
             'iteration': self.iteration,
             'metrics': metrics,
-            'embedding': decoded
+            'embedding': decoded,
+            'adjusted': adjusted,
+            'adjustment': adjustment_info
         })
-            
         return task_graph, metrics
 
 
@@ -356,16 +362,16 @@ class TaskTopologyGraph:
         self.edges = []
         self.dependency_matrix = None
         self.communication_matrix = None
-        self._service_resources = {}
+        self._task_resources = {}
         self.adjustment_history = []
         
     def build_from_data(self):
-        self._build_services()
+        self._build_tasks()
         self._build_dependencies()
         self._build_matrices()
         return self
         
-    def _build_services(self):
+    def _build_tasks(self):
         for task_id, task in self.data.task_nodes.items():
             self.tasks.append({
                 'id': task.id,
@@ -374,7 +380,7 @@ class TaskTopologyGraph:
                 'priority': task.priority,
                 'dependencies': task.dependencies.copy()
             }) 
-            self._service_resources[task.id] = {
+            self._task_resources[task.id] = {
                 'cpu': task.cpu_demand,
                 'memory': task.memory_demand
             }
@@ -409,26 +415,26 @@ class TaskTopologyGraph:
                 
         self.dependency_matrix = (self.communication_matrix > 0).astype(int)
         
-    def get_service_feature(self, service_id):
-        if service_id < len(self.tasks):
-            service = self.tasks[service_id]
+    def get_task_feature(self, task_id):
+        if task_id < len(self.tasks):
+            task = self.tasks[task_id]
             return np.array([
-                service['cpu_demand'],
-                service['memory_demand'],
-                len(service['dependencies'])
+                task['cpu_demand'],
+                task['memory_demand'],
+                len(task['dependencies'])
             ])
         return np.array([0, 0, 0])
         
-    def get_all_service_features(self):
+    def get_all_task_features(self):
         features = []
-        for service in self.tasks:
+        for task in self.tasks:
             features.append([
-                service['cpu_demand'],
-                service['memory_demand'],
-                len(service['dependencies'])
+                task['cpu_demand'],
+                task['memory_demand'],
+                len(task['dependencies'])
             ])
         if not features:
-            features = [[0.1, 0.1, 0] for _ in range(len(self.data.service_nodes))]
+            features = [[0.1, 0.1, 0] for _ in range(len(self.data.task_nodes))]
         return np.array(features)
         
     def get_edge_weight(self, src, dst):
@@ -443,15 +449,15 @@ class TaskTopologyGraph:
             total += edge['weight']
         return total
         
-    def get_service_resource_demand(self, service_id):
-        return self._service_resources.get(service_id, {'cpu': 0, 'memory': 0})
+    def get_task_resource_demand(self, task_id):
+        return self._task_resources.get(task_id, {'cpu': 0, 'memory': 0})
         
-    def get_service_count(self):
+    def get_task_count(self):
         return len(self.tasks)
         
     def get_topology_stats(self):
         return {
-            'service_count': len(self.tasks),
+            'task_count': len(self.tasks),
             'edge_count': len(self.edges),
             'avg_degree': np.mean([len(s['dependencies']) for s in self.tasks]) if self.tasks else 0,
             'total_communication': self.get_total_communication_weight(),
@@ -483,19 +489,19 @@ class TaskTopologyGraph:
         elif adjustment_type == 'reduce_dependency':
             self._reduce_high_latency_dependencies(feedback.get('threshold', 0.5))
         elif adjustment_type == 'increase_capacity':
-            self._increase_service_resources(feedback.get('scale_factor', 1.2))
+            self._increase_task_resources(feedback.get('scale_factor', 1.2))
         elif adjustment_type == 'decrease_capacity':
-            self._decrease_service_resources(feedback.get('scale_factor', 0.8))
+            self._decrease_task_resources(feedback.get('scale_factor', 0.8))
         elif adjustment_type == 'optimize_dependency':
             self._optimize_dependencies(feedback.get('threshold', 0.7))
         elif adjustment_type == 'rebalance_topology':
             self._rebalance_topology(feedback.get('target_balance', 0.5))
         elif adjustment_type == 'fine_tune':
             self._fine_tune_resources(feedback.get('scale_factor', 1.05))
-        elif adjustment_type == 'merge_services':
-            self._merge_dependent_services(feedback.get('merge_dependent', True))
-        elif adjustment_type == 'split_services':
-            self._split_high_load_services()
+        elif adjustment_type == 'merge_taskss':
+            self._merge_dependent_tasks(feedback.get('merge_dependent', True))
+        elif adjustment_type == 'split_tasks':
+            self._split_high_load_tasks()
             
         self._build_matrices()
         
@@ -517,22 +523,22 @@ class TaskTopologyGraph:
                 new_edges.append(edge)
         self.edges = new_edges
         
-    def _increase_service_resources(self, scale_factor):
-        for service in self.tasks:
-            service['cpu_demand'] *= scale_factor
-            service['memory_demand'] *= scale_factor
-            self._service_resources[service['id']] = {
-                'cpu': service['cpu_demand'],
-                'memory': service['memory_demand']
+    def _increase_task_resources(self, scale_factor):
+        for task in self.tasks:
+            task['cpu_demand'] *= scale_factor
+            task['memory_demand'] *= scale_factor
+            self._task_resources[task['id']] = {
+                'cpu': task['cpu_demand'],
+                'memory': task['memory_demand']
             }
             
-    def _decrease_service_resources(self, scale_factor):
-        for service in self.tasks:
-            service['cpu_demand'] = max(0.01, service['cpu_demand'] * scale_factor)
-            service['memory_demand'] = max(0.01, service['memory_demand'] * scale_factor)
-            self._service_resources[service['id']] = {
-                'cpu': service['cpu_demand'],
-                'memory': service['memory_demand']
+    def _decrease_task_resources(self, scale_factor):
+        for task in self.tasks:
+            task['cpu_demand'] = max(0.01, task['cpu_demand'] * scale_factor)
+            task['memory_demand'] = max(0.01, task['memory_demand'] * scale_factor)
+            self._task_resources[task['id']] = {
+                'cpu': task['cpu_demand'],
+                'memory': task['memory_demand']
             }
             
     def _optimize_dependencies(self, threshold):
@@ -549,38 +555,38 @@ class TaskTopologyGraph:
         self.edges = new_edges
         
     def _rebalance_topology(self, target_balance):
-        for service in self.tasks:
-            load = service['cpu_demand'] + service['memory_demand']
+        for task in self.tasks:
+            load = task['cpu_demand'] + task['memory_demand']
             if load > 2 * target_balance:
                 scale = target_balance / load
-                service['cpu_demand'] *= scale
-                service['memory_demand'] *= scale
-                self._service_resources[service['id']] = {
-                    'cpu': service['cpu_demand'],
-                    'memory': service['memory_demand']
+                task['cpu_demand'] *= scale
+                task['memory_demand'] *= scale
+                self._task_resources[task['id']] = {
+                    'cpu': task['cpu_demand'],
+                    'memory': task['memory_demand']
                 }
             elif load < 0.5 * target_balance:
                 scale = 1.2
-                service['cpu_demand'] *= scale
-                service['memory_demand'] *= scale
-                self._service_resources[service['id']] = {
-                    'cpu': service['cpu_demand'],
-                    'memory': service['memory_demand']
+                task['cpu_demand'] *= scale
+                task['memory_demand'] *= scale
+                self._task_resources[task['id']] = {
+                    'cpu': task['cpu_demand'],
+                    'memory': task['memory_demand']
                 }
                 
     def _fine_tune_resources(self, scale_factor):
-        for service in self.tasks:
-            service['cpu_demand'] *= scale_factor
-            service['memory_demand'] *= scale_factor
-            self._service_resources[service['id']] = {
-                'cpu': service['cpu_demand'],
-                'memory': service['memory_demand']
+        for task in self.tasks:
+            task['cpu_demand'] *= scale_factor
+            task['memory_demand'] *= scale_factor
+            self._task_resources[task['id']] = {
+                'cpu': task['cpu_demand'],
+                'memory': task['memory_demand']
             }
             
-    def _merge_dependent_services(self, merge_flag):
+    def _merge_dependent_tasks(self, merge_flag):
         pass
         
-    def _split_high_load_services(self):
+    def _split_high_load_tasks(self):
         pass
         
     def _split_critical_tasks(self, latency_threshold, success_threshold):
@@ -588,18 +594,18 @@ class TaskTopologyGraph:
             return
             
         critical_tasks = []
-        for service in self.tasks:
+        for task in self.tasks:
             latency = 0
             for edge in self.edges:
-                if edge['src'] == service['id'] or edge['dst'] == service['id']:
+                if edge['src'] == task['id'] or edge['dst'] == task['id']:
                     latency += edge.get('latency', 0)
             
             if latency > latency_threshold:
                 critical_tasks.append({
-                    'id': service['id'],
+                    'id': task['id'],
                     'latency': latency,
-                    'cpu': service['cpu_demand'],
-                    'memory': service['memory_demand']
+                    'cpu': task['cpu_demand'],
+                    'memory': task['memory_demand']
                 })
         
         for task in critical_tasks:
@@ -621,9 +627,9 @@ class TaskTopologyGraph:
                 'dependencies': [{'src': original_id, 'dst': len(self.tasks), 'bandwidth': 10, 'latency': 5}]
             }
             
-            for service in self.tasks:
-                if service['id'] == original_id:
-                    for dep in service['dependencies']:
+            for task in self.tasks:
+                if task['id'] == original_id:
+                    for dep in task['dependencies']:
                         if dep['src'] == original_id:
                             sub_task_2['dependencies'].append(dep)
             
@@ -631,11 +637,11 @@ class TaskTopologyGraph:
             self.tasks.append(sub_task_1)
             self.tasks.append(sub_task_2)
             
-            self._service_resources[sub_task_1['id']] = {
+            self._task_resources[sub_task_1['id']] = {
                 'cpu': sub_task_1['cpu_demand'],
                 'memory': sub_task_1['memory_demand']
             }
-            self._service_resources[sub_task_2['id']] = {
+            self._task_resources[sub_task_2['id']] = {
                 'cpu': sub_task_2['cpu_demand'],
                 'memory': sub_task_2['memory_demand']
             }
@@ -659,63 +665,63 @@ class TaskTopologyGraph:
             
         for i in range(len(self.tasks)):
             for j in range(i + 1, len(self.tasks)):
-                service_i = self.tasks[i]
-                service_j = self.tasks[j]
+                task_i = self.tasks[i]
+                task_j = self.tasks[j]
                 
                 comm_cost = 0
                 for edge in self.edges:
-                    if (edge['src'] == service_i['id'] and edge['dst'] == service_j['id']) or \
-                       (edge['src'] == service_j['id'] and edge['dst'] == service_i['id']):
+                    if (edge['src'] == task_i['id'] and edge['dst'] == task_j['id']) or \
+                       (edge['src'] == task_j['id'] and edge['dst'] == task_i['id']):
                         comm_cost = edge.get('bandwidth', 0) * edge.get('latency', 0)
                         break
                 
                 if comm_cost > comm_cost_threshold:
-                    merged_service = {
-                        'id': service_i['id'],
-                        'cpu_demand': service_i['cpu_demand'] + service_j['cpu_demand'],
-                        'memory_demand': service_i['memory_demand'] + service_j['memory_demand'],
+                    merged_task = {
+                        'id': task_i['id'],
+                        'cpu_demand': task_i['cpu_demand'] + task_j['cpu_demand'],
+                        'memory_demand': task_i['memory_demand'] + task_j['memory_demand'],
                         'dependencies': []
                     }
                     
-                    for dep in service_i['dependencies']:
-                        if dep['dst'] != service_j['id']:
-                            merged_service['dependencies'].append(dep)
-                    for dep in service_j['dependencies']:
-                        if dep['dst'] != service_i['id'] and dep['src'] != service_i['id']:
-                            merged_service['dependencies'].append({
-                                'src': service_i['id'],
+                    for dep in task_i['dependencies']:
+                        if dep['dst'] != task_j['id']:
+                            merged_task['dependencies'].append(dep)
+                    for dep in task_j['dependencies']:
+                        if dep['dst'] != task_i['id'] and dep['src'] != task_i['id']:
+                            merged_task['dependencies'].append({
+                                'src': task_i['id'],
                                 'dst': dep['dst'],
                                 'bandwidth': dep.get('bandwidth', 0),
                                 'latency': dep.get('latency', 0)
                             })
                     
-                    self.tasks = [s for s in self.tasks if s['id'] not in [service_i['id'], service_j['id']]]
-                    self.tasks.append(merged_service)
+                    self.tasks = [s for s in self.tasks if s['id'] not in [task_i['id'], task_j['id']]]
+                    self.tasks.append(merged_task)
                     
-                    self._service_resources[merged_service['id']] = {
-                        'cpu': merged_service['cpu_demand'],
-                        'memory': merged_service['memory_demand']
+                    self._task_resources[merged_task['id']] = {
+                        'cpu': merged_task['cpu_demand'],
+                        'memory': merged_task['memory_demand']
                     }
                     
                     new_edges = []
                     for edge in self.edges:
-                        if edge['src'] not in [service_i['id'], service_j['id']] and \
-                           edge['dst'] not in [service_i['id'], service_j['id']]:
+                        if edge['src'] not in [task_i['id'], task_j['id']] and \
+                           edge['dst'] not in [task_i['id'], task_j['id']]:
                             new_edges.append(edge)
                     self.edges = new_edges
                     
                     break
                     
     def _adjust_task_priority(self, lambda1, lambda2):
-        for service in self.tasks:
-            success_rate = service.get('success_rate', 0.9)
+        for task in self.tasks:
+            success_rate = task.get('success_rate', 0.9)
             latency = 0
             for edge in self.edges:
-                if edge['src'] == service['id']:
+                if edge['src'] == task['id']:
                     latency += edge.get('latency', 0)
             
             priority = lambda1 / (latency + 1) + lambda2 * success_rate
-            service['priority'] = priority
+            task['priority'] = priority
             
     def _modify_dependency_edges(self, threshold):
         if not self.edges:
@@ -746,47 +752,47 @@ class TaskTopologyGraph:
             
         new_task_graph = TaskTopologyGraph(self.data)
         new_task_graph.tasks = []
-        new_task_graph._service_resources = {}
+        new_task_graph._task_resources = {}
         
         if variation_type == 'random':
-            for i, service in enumerate(self.tasks):
+            for i, task in enumerate(self.tasks):
                 cpu_var = np.random.uniform(0.8, 1.2)
                 mem_var = np.random.uniform(0.8, 1.2)
                 new_task_graph.tasks.append({
                     'id': i,
-                    'cpu_demand': service['cpu_demand'] * cpu_var,
-                    'memory_demand': service['memory_demand'] * mem_var,
-                    'dependencies': service['dependencies'].copy()
+                    'cpu_demand': task['cpu_demand'] * cpu_var,
+                    'memory_demand': task['memory_demand'] * mem_var,
+                    'dependencies': task['dependencies'].copy()
                 })
-                new_task_graph._service_resources[i] = {
+                new_task_graph._task_resources[i] = {
                     'cpu': new_task_graph.tasks[-1]['cpu_demand'],
                     'memory': new_task_graph.tasks[-1]['memory_demand']
                 }
                 
         elif variation_type == 'scale_up':
-            for i, service in enumerate(self.tasks):
+            for i, task in enumerate(self.tasks):
                 scale = np.random.uniform(1.0, 1.5)
                 new_task_graph.tasks.append({
                     'id': i,
-                    'cpu_demand': service['cpu_demand'] * scale,
-                    'memory_demand': service['memory_demand'] * scale,
-                    'dependencies': service['dependencies'].copy()
+                    'cpu_demand': task['cpu_demand'] * scale,
+                    'memory_demand': task['memory_demand'] * scale,
+                    'dependencies': task['dependencies'].copy()
                 })
-                new_task_graph._service_resources[i] = {
+                new_task_graph._task_resources[i] = {
                     'cpu': new_task_graph.tasks[-1]['cpu_demand'],
                     'memory': new_task_graph.tasks[-1]['memory_demand']
                 }
                 
         elif variation_type == 'scale_down':
-            for i, service in enumerate(self.tasks):
+            for i, task in enumerate(self.tasks):
                 scale = np.random.uniform(0.5, 1.0)
                 new_task_graph.tasks.append({
                     'id': i,
-                    'cpu_demand': max(0.01, service['cpu_demand'] * scale),
-                    'memory_demand': max(0.01, service['memory_demand'] * scale),
-                    'dependencies': service['dependencies'].copy()
+                    'cpu_demand': max(0.01, task['cpu_demand'] * scale),
+                    'memory_demand': max(0.01, task['memory_demand'] * scale),
+                    'dependencies': task['dependencies'].copy()
                 })
-                new_task_graph._service_resources[i] = {
+                new_task_graph._task_resources[i] = {
                     'cpu': new_task_graph.tasks[-1]['cpu_demand'],
                     'memory': new_task_graph.tasks[-1]['memory_demand']
                 }
@@ -798,7 +804,7 @@ class TaskTopologyGraph:
                 'memory_demand': s['memory_demand'],
                 'dependencies': s['dependencies'].copy()
             } for i, s in enumerate(self.tasks)]
-            new_task_graph._service_resources = dict(self._service_resources)
+            new_task_graph._task_resources = dict(self._task_resources)
             
             if len(self.edges) > 0:
                 num_changes = max(1, len(self.edges) // 5)
@@ -825,7 +831,7 @@ class TaskTopologyGraph:
             'memory_demand': s['memory_demand'],
             'dependencies': s['dependencies'].copy()
         } for s in self.tasks]
-        new_graph._service_resources = dict(self._service_resources)
+        new_graph._task_resources = dict(self._task_resources)
         new_graph.edges = [{
             'src': e['src'],
             'dst': e['dst'],
@@ -836,7 +842,7 @@ class TaskTopologyGraph:
         return new_graph
         
     def __repr__(self):
-        return f"TaskGraph(services={len(self.tasks)}, edges={len(self.edges)})"
+        return f"TaskGraph(tasks={len(self.tasks)}, edges={len(self.edges)})"
 
 def load_data():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -855,7 +861,7 @@ def load_data():
     task_graph = TaskTopologyGraph(data)
     task_graph.build_from_data()
     print(f"Task Graph: {task_graph}")
-    print(f"  Nodes: {task_graph.get_service_count()}")
+    print(f"  Nodes: {task_graph.get_task_count()}")
 
     return data, resource_graph, task_graph
 
@@ -870,8 +876,8 @@ def test_resource_aware_generator():
     print(f"  Shape: {Z_R.shape}")
     
     print("\n--- Test 2: Generate Task Features ---")
-    for i, service in enumerate(task_graph.tasks[:3]):
-        task_embedding, feasible_neighbors = generator.generate_task_features(service)
+    for i, task in enumerate(task_graph.tasks[:3]):
+        task_embedding, feasible_neighbors = generator.generate_task_features(task)
         print(f"  Task {i}:")
         print(f"    Embedding: {task_embedding}")
         print(f"    Feasible UAV neighbors: {feasible_neighbors}")
@@ -934,13 +940,13 @@ def test_resource_aware_generator():
     optimized_metrics = generator.evaluate_deployment(optimized_graph)
     
     print(f"  Original Task Graph:")
-    print(f"    Services: {len(task_graph.tasks)}, Edges: {len(task_graph.edges)}")
+    print(f"    Tasks: {len(task_graph.tasks)}, Edges: {len(task_graph.edges)}")
     print(f"    R_success: {original_metrics['R_success']:.4f}")
     print(f"    T_latency: {original_metrics['T_latency']:.2f} ms")
     print(f"    Match score: {original_metrics['match_score']:.4f}")
     
     print(f"\n  Optimized Task Graph:")
-    print(f"    Services: {len(optimized_graph.services)}, Edges: {len(optimized_graph.edges)}")
+    print(f"    Tasks: {len(optimized_graph.tasks)}, Edges: {len(optimized_graph.edges)}")
     print(f"    R_success: {optimized_metrics['R_success']:.4f}")
     print(f"    T_latency: {optimized_metrics['T_latency']:.2f} ms")
     print(f"    Match score: {optimized_metrics['match_score']:.4f}")
@@ -955,9 +961,9 @@ def test_resource_aware_generator():
 
 def test_task_graph():
     data, _, task_graph = load_data()
-    print("\n--- Services ---")
-    for i, service in enumerate(task_graph.tasks):
-        print(f"  Task {i}: cpu={service['cpu_demand']}, mem={service['memory_demand']}, deps={len(service['dependencies'])}")
+    print("\n--- Tasks ---")
+    for i, task in enumerate(task_graph.tasks):
+        print(f"  Task {i}: cpu={task['cpu_demand']}, mem={task['memory_demand']}, deps={len(task['dependencies'])}")
     
     print("\n--- Dependencies ---")
     for edge in task_graph.edges:
@@ -967,8 +973,8 @@ def test_task_graph():
     print(task_graph.communication_matrix)
     
     print("\n--- Task Features ---")
-    for i in range(task_graph.get_service_count()):
-        feature = task_graph.get_service_feature(i)
+    for i in range(task_graph.get_task_count()):
+        feature = task_graph.get_task_feature(i)
         print(f"  Task {i}: {feature}")
     
     print("\n--- Topology Stats ---")
@@ -988,7 +994,7 @@ def test_task_graph():
     }
     task_graph.adjust_topology(feedback1)
     print(f"After split: {task_graph}")
-    print(f"  Services: {len(task_graph.tasks)}")
+    print(f"  Tasks: {len(task_graph.tasks)}")
     print(f"  Edges: {len(task_graph.edges)}")
     
     task_graph = TaskTopologyGraph(data)
@@ -1001,7 +1007,7 @@ def test_task_graph():
     }
     task_graph.adjust_topology(feedback2)
     print(f"After merge: {task_graph}")
-    print(f"  Services: {len(task_graph.tasks)}")
+    print(f"  Tasks: {len(task_graph.tasks)}")
     print(f"  Edges: {len(task_graph.edges)}")
     
     task_graph = TaskTopologyGraph(data)
@@ -1015,8 +1021,8 @@ def test_task_graph():
     }
     task_graph.adjust_topology(feedback3)
     print(f"After priority adjust: {task_graph}")
-    for i, service in enumerate(task_graph.tasks):
-        priority = service.get('priority', 'N/A')
+    for i, task in enumerate(task_graph.tasks):
+        priority = task.get('priority', 'N/A')
         print(f"  Task {i} priority: {priority}")
     
     task_graph = TaskTopologyGraph(data)
@@ -1040,8 +1046,8 @@ def test_task_graph():
     variation = task_graph.generate_variation('random', seed=42)
     print(f"Original: {task_graph}")
     print(f"Variation: {variation}")
-    for i, service in enumerate(variation.tasks):
-        print(f"  Task {i}: cpu={service['cpu_demand']:.2f}, mem={service['memory_demand']:.2f}")
+    for i, task in enumerate(variation.tasks):
+        print(f"  Task {i}: cpu={task['cpu_demand']:.2f}, mem={task['memory_demand']:.2f}")
     
     print("\n--- Test 6: Clone ---")
     cloned = task_graph.clone()
@@ -1112,8 +1118,10 @@ def test_generate_resource_aware_task_graph():
 
 
 if __name__ == '__main__':
-    # test_task_graph()
-    # print("\n\n")
-    # test_resource_aware_generator()
-    # test_Z_R_Z_T()
+    test_task_graph()
+    print("\n\n")
+    test_resource_aware_generator()
+    print("\n\n")
+    test_Z_R_Z_T()
+    print("\n\n")
     test_generate_resource_aware_task_graph()

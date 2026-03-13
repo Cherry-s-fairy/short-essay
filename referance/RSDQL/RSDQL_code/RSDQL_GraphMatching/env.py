@@ -38,7 +38,7 @@ class Env:
         
     def _build_state(self):
         resource_features = self.resource_graph.get_all_node_features()
-        task_features = self.task_graph.get_all_service_features()
+        task_features = self.task_graph.get_all_task_features()
         
         state = {
             'resource_features': resource_features,
