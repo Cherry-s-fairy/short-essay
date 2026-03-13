@@ -1,11 +1,17 @@
 #-*- coding: utf-8 -*-
-
+import sys
+import os
 import numpy as np
+from numpy.linalg import norm
 import random
 import torch
 import torch.nn as nn
+
 from resources_gat_encoder import ResourcesGATEncoder
 from tasks_gat_encoder import TasksGATEncoder
+from dataSet.data import Data
+from resource_graph import ResourceTopologyGraph
+
 
 class EdgeFeasibilityNet(nn.Module):
     def __init__(self, resource_dim=32, edge_dim=4):
@@ -162,15 +168,33 @@ class ResourceAwareTaskGraphGenerator:
     def decode_combined_embedding(self):
         if self.Z_R is None or self.Z_T is None:
             return {}
-            
+    
+        # 分别从资源和任务嵌入中提取指标
+        resource_adaptation_score = float(np.mean(self.Z_R)) if len(self.Z_R) > 0 else 0
+        task_complexity = float(np.mean(self.Z_T)) if len(self.Z_T) > 0 else 0
+
+        # 计算嵌入的方差（表示多样性/复杂度）
+        resource_variance = float(np.var(self.Z_R)) if len(self.Z_R) > 0 else 0
+        task_variance = float(np.var(self.Z_T)) if len(self.Z_T) > 0 else 0
+
+        # 任务-资源嵌入相似度（图匹配关键分数）
+        cos_sim = 0.0
+        if norm(self.Z_R) > 0 and norm(self.Z_T) > 0:
+            cos_sim = float(np.dot(self.Z_R, self.Z_T) / (norm(self.Z_R) * norm(self.Z_T)))
+        # 计算两个嵌入之间的相似度（表示匹配度）
         combined = np.concatenate([self.Z_T, self.Z_R])
-        
+        combined = (combined - np.min(combined)) / (np.max(combined) - np.min(combined) + 1e-6)
+
         decoded = {
-            'resource_adaptation_score': float(np.mean(combined[:3])) if len(combined) >= 3 else 0,
-            'task_complexity': float(np.mean(combined[3:6])) if len(combined) >= 6 else 0,
+            'resource_adaptation_score': resource_adaptation_score,      # 基于Z_R
+            'task_complexity': task_complexity,                           # 基于Z_T
+            'resource_variance': resource_variance,                       # 资源多样性
+            'task_variance': task_variance,                               # 任务多样性
+            'resource_task_similarity': round(cos_sim, 4),
+            'embedding_dimension': len(combined),
             'embedding': combined.tolist()
         }
-        
+
         return decoded
         
     def evaluate_deployment(self, task_graph):
@@ -179,47 +203,59 @@ class ResourceAwareTaskGraphGenerator:
                 'R_success': 0.0,
                 'T_latency': 0.0,
                 'F_resched': 0,
-                'match_score': 0.0
+                'match_score': 0.0,
+                'cpu_util': 0.0,
+                'mem_util': 0.0
             }
-            
-        total_cpu_demand = sum(s.get('cpu_demand', 0) for s in task_graph.tasks)
-        total_mem_demand = sum(s.get('memory_demand', 0) for s in task_graph.tasks)
+
+        # ===================== 1. 计算资源利用率 =====================
+        total_cpu_demand = sum(t.get('cpu_demand', 0) for t in task_graph.tasks)
+        total_mem_demand = sum(t.get('memory_demand', 0) for t in task_graph.tasks)
         
-        total_cpu_capacity = sum(n.get('total_cpu', 0) for n in self.resource_graph.nodes)
-        total_mem_capacity = sum(n.get('total_memory', 0) for n in self.resource_graph.nodes)
-        
-        cpu_util = total_cpu_demand / max(total_cpu_capacity, 1)
-        mem_util = total_mem_demand / max(total_mem_capacity, 1)
-        
-        R_success = min(1.0, (1 - cpu_util) * (1 - mem_util))
-        
-        if task_graph.edges:
-            latencies = []
+        total_cpu_capacity = sum(n.get('remain_cpu', 0) for n in self.resource_graph.nodes)
+        total_mem_capacity = sum(n.get('remain_memory', 0) for n in self.resource_graph.nodes)
+
+        cpu_util = min(1.0, total_cpu_demand / max(total_cpu_capacity, 1))
+        mem_util = min(1.0, total_mem_demand / max(total_mem_capacity, 1))
+
+        cpu_satisfy = 1.0 if total_cpu_demand <= total_cpu_capacity else max(0.0, total_cpu_capacity / total_cpu_demand)
+        mem_satisfy = 1.0 if total_mem_demand <= total_mem_capacity else max(0.0, total_mem_capacity / total_mem_demand)
+        R_success = (cpu_satisfy + mem_satisfy) / 2  # 均衡CPU/内存满足度
+
+        # ===================== 2. 计算通信质量（用comm_feasibility） =====================
+        comm_scores = []
+        if hasattr(task_graph, 'edges') and task_graph.edges:
             for edge in task_graph.edges:
-                src = edge.get('src', 0) - 1
-                dst = edge.get('dst', 0) - 1
-                if src >= 0 and dst >= 0:
-                    dist = self.resource_graph.get_shortest_path_distance(src, dst)
-                    if dist < float('inf'):
-                        latencies.append(dist * 10)
-            T_latency = np.mean(latencies) if latencies else 0
-        else:
-            T_latency = 0
-            
-        if R_success < 0.7:
-            F_resched = int((1 - R_success) * 10)
+                comm = edge.get('comm_feasibility', 0.05)
+                comm_scores.append(comm)
+
+        # 通信质量得分（越高越好）
+        comm_score = np.mean(comm_scores) if comm_scores else 0.5
+
+        # ===================== 3. 重调度次数 =====================
+        if R_success < 0.6:
+            F_resched = min(5, int((0.6 - R_success) * 10))  # 限制最大重调度次数
         else:
             F_resched = 0
-            
-        match_score = R_success * 0.5 + (1 - min(1, T_latency / 100)) * 0.3 + (1 - cpu_util) * 0.2
+
+        # ===================== 4. 综合匹配得分（可配置权重） =====================
+        w_resource = 0.4  # 资源权重
+        w_comm = 0.4  # 通信权重
+        w_util = 0.2  # 利用率权重
+        match_score = (
+                R_success * w_resource +
+                comm_score * w_comm +
+                (1 - (cpu_util + mem_util) / 2) * w_util
+        )
+        match_score = round(min(1.0, max(0.0, match_score)), 4)
         
         return {
-            'R_success': R_success,
-            'T_latency': T_latency,
+            'R_success': round(R_success, 4),
+            'T_latency': round(comm_score, 4),
             'F_resched': F_resched,
             'match_score': match_score,
-            'cpu_utilization': cpu_util,
-            'memory_utilization': mem_util
+            'cpu_utilization': round(cpu_util, 4),
+            'memory_utilization': round(mem_util, 4)
         }
         
     def generate_resource_aware_task_graph(self, task_graph):
@@ -266,10 +302,10 @@ class ResourceAwareTaskGraphGenerator:
                 latency_diff = abs(curr_metrics['T_latency'] - prev_metrics['T_latency'])
                 
                 if success_diff < self.convergence_threshold and latency_diff < 1.0:
-                    break
+                    break                    
                     
             if metrics['R_success'] >= 0.85 and metrics['T_latency'] < 80:
-                break
+                break                
                 
         return current_graph, self.history
         
@@ -802,29 +838,29 @@ class TaskTopologyGraph:
     def __repr__(self):
         return f"TaskGraph(services={len(self.tasks)}, edges={len(self.edges)})"
 
-
-def test_resource_aware_generator():
-    import sys
-    import os
+def load_data():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    
-    from dataSet.data import Data
-    from resource_graph import ResourceTopologyGraph
-    
-    print("="*70)
-    print("ResourceAwareTaskGraphGenerator Test")
-    print("="*70)
-    
+
+    print("=" * 70)
+    print("Loading data")
+    print("=" * 70)
+
     data = Data('dataSet/data.xml')
+
     resource_graph = ResourceTopologyGraph(data)
     resource_graph.build_from_data()
-    
     print(f"\nResource Graph: {resource_graph}")
     print(f"  Nodes: {resource_graph.get_node_count()}")
-    
+
     task_graph = TaskTopologyGraph(data)
     task_graph.build_from_data()
     print(f"Task Graph: {task_graph}")
+    print(f"  Nodes: {task_graph.get_service_count()}")
+
+    return data, resource_graph, task_graph
+
+def test_resource_aware_generator():
+    data, resource_graph, task_graph = load_data()
     
     generator = ResourceAwareTaskGraphGenerator(resource_graph, data)
     
@@ -918,25 +954,7 @@ def test_resource_aware_generator():
 
 
 def test_task_graph():
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    
-    from dataSet.data import Data
-    
-    print("="*60)
-    print("TaskTopologyGraph Test")
-    print("="*60)
-    
-    data = Data('dataSet/data.xml')
-    print(f"\nLoaded {len(data.task_nodes)} task nodes")
-    print(f"Loaded {len(data.task_edges)} task edges")
-    
-    task_graph = TaskTopologyGraph(data)
-    task_graph.build_from_data()
-    
-    print(f"\n{task_graph}")
-    
+    data, _, task_graph = load_data()
     print("\n--- Services ---")
     for i, service in enumerate(task_graph.tasks):
         print(f"  Task {i}: cpu={service['cpu_demand']}, mem={service['memory_demand']}, deps={len(service['dependencies'])}")
@@ -1035,28 +1053,7 @@ def test_task_graph():
     print("="*60)
 
 def test_Z_R_Z_T():
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-    from dataSet.data import Data
-    from resource_graph import ResourceTopologyGraph
-
-    print("=" * 70)
-    print("ResourceAwareTaskGraphGenerator Test")
-    print("=" * 70)
-
-    data = Data('dataSet/data.xml')
-
-    resource_graph = ResourceTopologyGraph(data)
-    resource_graph.build_from_data()
-    print(f"\nResource Graph: {resource_graph}")
-    print(f"  Nodes: {resource_graph.get_node_count()}")
-
-    task_graph = TaskTopologyGraph(data)
-    task_graph.build_from_data()
-    print(f"Task Graph: {task_graph}")
-    print(f"  Nodes: {task_graph.get_service_count()}")
+    data, resource_graph, task_graph = load_data()
 
     generator = ResourceAwareTaskGraphGenerator(resource_graph, data)
 
@@ -1070,8 +1067,53 @@ def test_Z_R_Z_T():
     print(f"  Z_T (task embedding): {Z_T}")
     print(f"  Shape: {Z_T.shape}")
 
+def test_generate_resource_aware_task_graph():
+    data, resource_graph, task_graph = load_data()
+
+    print("\n[Step 1] 初始化 ResourceAwareTaskGraphGenerator...")
+    generator = ResourceAwareTaskGraphGenerator(resource_graph, data)
+    print(f"  GAT隐藏维度: {generator.gnn_hidden_dim}")
+    print(f"  GAT层数: {generator.gnn_num_layers}")
+    print(f"  注意力头数: {generator.num_heads}")
+
+    print("\n[Step 2] 调用 generate_resource_aware_task_graph()...")
+    result_graph, metrics = generator.generate_resource_aware_task_graph(task_graph)
+
+    print("\n" + "=" * 70)
+    print("                        测试结果")
+    print("=" * 70)
+
+    print("\n[1] 返回的任务图:")
+    print(f"    任务数量: {len(result_graph.tasks)}")
+    print(f"    边数量: {len(result_graph.edges)}")
+
+    print("\n[2] 部署评估指标 (metrics):")
+    print(f"    R_success (成功率): {metrics.get('R_success', 0):.4f}")
+    print(f"    T_latency (时延):   {metrics.get('T_latency', 0):.2f} ms")
+    print(f"    F_resched (重调):   {metrics.get('F_resched', 0)}")
+    print(f"    match_score (匹配分): {metrics.get('match_score', 0):.4f}")
+    print(f"    cpu_utilization:    {metrics.get('cpu_utilization', 0):.4f}")
+    print(f"    memory_utilization: {metrics.get('memory_utilization', 0):.4f}")
+
+    print("\n[3] 编码向量:")
+    print(f"    Z_R (资源嵌入): shape={generator.Z_R.shape}")
+    print(f"    Z_R: {generator.Z_R}")
+    print(f"    Z_T (任务嵌入): shape={generator.Z_T.shape}")
+    print(f"    Z_T: {generator.Z_T}")
+
+    print("\n[4] 历史记录:")
+    print(f"    迭代次数: {len(generator.history)}")
+    for i, record in enumerate(generator.history):
+        print(f"    迭代 {i + 1}: {record.get('metrics', {})}")
+
+    print("\n" + "=" * 70)
+    print("                      测试完成!")
+    print("=" * 70)
+
+
 if __name__ == '__main__':
     # test_task_graph()
     # print("\n\n")
     # test_resource_aware_generator()
-    test_Z_R_Z_T()
+    # test_Z_R_Z_T()
+    test_generate_resource_aware_task_graph()
