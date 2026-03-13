@@ -59,10 +59,11 @@ class Data:
                 dst = int(edge_elem.find('dst').text)
                 bandwidth = _get_element_text(edge_elem, 'bandwidth', default=0)
                 latency = _get_element_text(edge_elem, 'latency', default=inf)
+                loss = _get_element_text(edge_elem, 'loss', default=inf)
                 data = _get_element_text(edge_elem, 'data', default=0)
-                self.task_nodes[src].add_src_edge(src, dst, bandwidth, latency, 0, data)
-                self.task_nodes[dst].add_dependencies(src, dst, bandwidth, latency, 0, data)
-                self.task_edges.append(Edge(src, dst, bandwidth, latency, 0, data))
+                self.task_nodes[src].add_src_edge(src, dst, bandwidth, latency, loss, data)
+                self.task_nodes[dst].add_dependencies(src, dst, bandwidth, latency, loss, data)
+                self.task_edges.append(Edge(src, dst, bandwidth, latency, loss, data))
 
 
 class UAV:
@@ -162,7 +163,7 @@ def test_data_loading():
 
     print("\n=== Task Edges ===")
     for edge in data.task_edges:
-        print(f"  {edge.src} -> {edge.dst}: bw={edge.bandwidth:.2f}, lat={edge.latency:.2f}, data={edge.data}")
+        print(f"  {edge.src} -> {edge.dst}: bw={edge.bandwidth:.2f}, lat={edge.latency:.2f}, loss={edge.loss:.2f}, data={edge.data}")
 
 if __name__ == "__main__":
     test_data_loading()

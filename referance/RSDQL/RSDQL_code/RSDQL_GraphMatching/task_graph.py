@@ -2,9 +2,28 @@
 
 import numpy as np
 import random
+import torch
+import torch.nn as nn
 from resources_gat_encoder import ResourcesGATEncoder
 from tasks_gat_encoder import TasksGATEncoder
 
+class EdgeFeasibilityNet(nn.Module):
+    def __init__(self, resource_dim=32, edge_dim=4):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(resource_dim + edge_dim, 32),
+            nn.ReLU(),
+
+            nn.Linear(32, 16),
+            nn.ReLU(),
+
+            nn.Linear(16, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 class ResourceAwareTaskGraphGenerator:
     def __init__(self, resource_graph, data=None, use_pyg=False):
@@ -34,6 +53,8 @@ class ResourceAwareTaskGraphGenerator:
             num_heads=self.num_heads,
             use_pyg=use_pyg
         )
+
+        self.edge_model = EdgeFeasibilityNet()
 
     # gat对资源图编码
     def encode_resource_graph(self):
@@ -90,38 +111,30 @@ class ResourceAwareTaskGraphGenerator:
     def filter_dependency_edges(self, edges, resource_aware=True):
         if not resource_aware:
             return edges
-            
+        if self.Z_R is None:
+            self.encode_resource_graph()
+
         filtered_edges = []
-        max_data_size = 1024  # 假设最大传输量为1024MB
-        alpha = 0.8  # 数据量权重系数，可配置
-        
+        Z_R = torch.tensor(self.Z_R, dtype=torch.float32)
+        print("=== filter_dependency_edges ===")
+        print(f"uavs count = {self.resource_graph.get_node_count()}")
         for edge in edges:
             src = edge.get('src', 1) - 1
             dst = edge.get('dst', 1) - 1
-            bandwidth = edge.get('bandwidth', 0)
-            latency = edge.get('latency', 0)
-            loss = edge.get('loss', 0)
+            bandwidth = max(edge.get('bandwidth', 0), 1e-6)
+            latency = edge.get('latency', float('inf'))
+            loss = edge.get('loss', 1.0)
             data = edge.get('data', 0)
-
-            comm_feasibility = 0.0
-            if 0 <= src < self.resource_graph.get_node_count() and 0 <= dst < self.resource_graph.get_node_count():
-                path_distance = self.resource_graph.get_shortest_path_distance(src, dst)
-
-                if path_distance < float('inf') and path_distance > 0:
-                    # 处理丢包率（限制在[0, 1]，避免异常值）
-                    loss = max(0.0, min(1.0, loss))
-                    loss_correction = 1 - loss  # 丢包率越高，修正系数越小
-                    # 处理数据传输量（归一化 + 惩罚项）
-                    norm_data_size = min(data / max_data_size, 1.0)  # 归一化到[0,1]
-                    data_penalty = alpha * norm_data_size  # 数据量越大，惩罚越重
-                    # 加入延迟因子，更合理的通信可行性计算
-                    denominator = path_distance + latency + data_penalty + 1e-6
-                    comm_feasibility = (bandwidth * loss_correction) / denominator
-                    comm_feasibility = min(comm_feasibility, 1.0)  # 归一化到[0,1]
-
-                if comm_feasibility > 0.1:
-                    edge['comm_feasibility'] = comm_feasibility
-                    filtered_edges.append(edge)
+            edge_feature = torch.tensor(
+                [bandwidth, latency, loss, data],
+                dtype=torch.float32
+            )
+            x = torch.cat([edge_feature, Z_R])
+            feasibility = self.edge_model(x).item()
+            if feasibility > 0.5:
+                edge['comm_feasibility'] = feasibility
+                filtered_edges.append(edge)
+            print(f"边 {src}→{dst}：bandwidth={bandwidth}, latency={latency}, loss={loss}, data={data}, weight={edge.get('weight')}, comm_feasibility={feasibility}")
 
         return filtered_edges
         
@@ -130,16 +143,20 @@ class ResourceAwareTaskGraphGenerator:
         if not tasks:
             self.Z_T = np.zeros(self.gnn_hidden_dim)  # 改为GAT隐藏维度
             return self.Z_T
-            
-        features = []
+
+        print("=== 任务节点原始特征 ===")
         for task in tasks:
-            feature, _ = self.generate_task_features(task)
-            features.append(feature)
+            self.generate_task_features(task)
+            print(f"任务：{task}")
+
 
         edges = task_graph.edges if hasattr(task_graph, 'edges') else []
         filtered_edges = self.filter_dependency_edges(edges, resource_aware=True)
+        print("\n=== 过滤后的边特征 ===")
+        for edge in filtered_edges:
+            print(f"边 {edge.get('src')}→{edge.get('dst')}：comm_feasibility={edge.get('comm_feasibility')}, weight={edge.get('weight')}")
 
-        self.Z_T = self.tasks_gat_encoder.encode(features, filtered_edges)
+        self.Z_T = self.tasks_gat_encoder.encode(tasks, filtered_edges)
         return self.Z_T
         
     def decode_combined_embedding(self):
@@ -1017,7 +1034,7 @@ def test_task_graph():
     print("Test Complete!")
     print("="*60)
 
-def test_Z_R():
+def test_Z_R_Z_T():
     import sys
     import os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1030,15 +1047,16 @@ def test_Z_R():
     print("=" * 70)
 
     data = Data('dataSet/data.xml')
+
     resource_graph = ResourceTopologyGraph(data)
     resource_graph.build_from_data()
-
     print(f"\nResource Graph: {resource_graph}")
     print(f"  Nodes: {resource_graph.get_node_count()}")
 
     task_graph = TaskTopologyGraph(data)
     task_graph.build_from_data()
     print(f"Task Graph: {task_graph}")
+    print(f"  Nodes: {task_graph.get_service_count()}")
 
     generator = ResourceAwareTaskGraphGenerator(resource_graph, data)
 
@@ -1047,8 +1065,13 @@ def test_Z_R():
     print(f"  Z_R (resource embedding): {Z_R}")
     print(f"  Shape: {Z_R.shape}")
 
+    print("\n--- Test 2: Encode Task Graph ---")
+    Z_T = generator.encode_task_graph(task_graph)
+    print(f"  Z_T (task embedding): {Z_T}")
+    print(f"  Shape: {Z_T.shape}")
+
 if __name__ == '__main__':
     # test_task_graph()
     # print("\n\n")
     # test_resource_aware_generator()
-    test_Z_R()
+    test_Z_R_Z_T()

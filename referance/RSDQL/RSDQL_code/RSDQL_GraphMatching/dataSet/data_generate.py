@@ -31,6 +31,9 @@ def task_random_bandwidth():
 def task_random_latency():
     return random.choice([15, 18, 20, 23, 26, 28])  # ms
 
+def task_random_loss():
+    return round(random.choice([0, 1, 2, 3, 4, 5, 6]) * 0.01, 2)
+
 def task_random_data(max_val=200):
     return random.randint(20, max_val)
 
@@ -104,6 +107,7 @@ def generate_task_edges(count, node_num):
         ET.SubElement(edge, "dst").text = str(dst)
         ET.SubElement(edge, "bandwidth").text = str(task_random_bandwidth())
         ET.SubElement(edge, "latency").text = str(task_random_latency())
+        ET.SubElement(edge, "loss").text = str(task_random_loss())
         ET.SubElement(edge, "data").text = str(task_random_data())
         edges.append(edge)
     return edges

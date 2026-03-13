@@ -99,7 +99,7 @@ class ResourceTopologyGraph:
             src = edge['src'] - 1
             dst = edge['dst'] - 1
             if 0 <= src < n and 0 <= dst < n:
-                self.distance_matrix[src][dst] = edge['latency']
+                self.distance_matrix[src][dst] = edge['weight']
                 
         for i in range(n):
             self.distance_matrix[i][i] = 0
@@ -138,9 +138,7 @@ class ResourceTopologyGraph:
         if src < 0 or dst < 0 or src >= n or dst >= n:
             return float('inf')
         dist = self.distance_matrix[src][dst]
-        if dist < float('inf'):
-            return dist
-        return float('inf')
+        return dist
         
     def get_node_resource_capacity(self):
         capacities = []
