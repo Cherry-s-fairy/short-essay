@@ -1116,12 +1116,50 @@ def test_generate_resource_aware_task_graph():
     print("                      测试完成!")
     print("=" * 70)
 
+def test_evaluate_with_adjustment():
+    data, resource_graph, task_graph = load_data()
+    total_cpu = sum(n.get('total_cpu', 0) for n in resource_graph.nodes)
+    total_mem = sum(n.get('total_memory', 0) for n in resource_graph.nodes)
+    print(f"\n[资源容量] CPU: {total_cpu}, Memory: {total_mem}")
+
+    total_cpu_demand = sum(t.get('cpu_demand', 0) for t in task_graph.tasks)
+    total_mem_demand = sum(t.get('memory_demand', 0) for t in task_graph.tasks)
+    print(f"[任务需求] CPU: {total_cpu_demand}, Memory: {total_mem_demand}")
+
+    generator = ResourceAwareTaskGraphGenerator(resource_graph, data)
+    generator.iteration = 1
+
+    adjusted_graph, metrics = generator.evaluate_with_adjustment(
+        task_graph, total_cpu, total_mem
+    )
+    print("\n[调整前任务需求]")
+    print(f"  CPU: {total_cpu_demand}, Memory: {total_mem_demand}")
+    print(f"  CPU利用率: {total_cpu_demand / total_cpu:.2f}, Memory利用率: {total_mem_demand / total_mem:.2f}")
+
+    new_cpu = sum(t.get('cpu_demand', 0) for t in adjusted_graph.tasks)
+    new_mem = sum(t.get('memory_demand', 0) for t in adjusted_graph.tasks)
+    print("\n[调整后任务需求]")
+    print(f"  CPU: {new_cpu}, Memory: {new_mem}")
+    print(f"  CPU利用率: {new_cpu / total_cpu:.2f}, Memory利用率: {new_mem / total_mem:.2f}")
+
+    print("\n[评估指标]")
+    print(f"  R_success: {metrics.get('R_success', 0):.4f}")
+    print(f"  T_latency: {metrics.get('T_latency', 0):.2f} ms")
+    print(f"  cpu_utilization: {metrics.get('cpu_utilization', 0):.4f}")
+    print(f"  memory_utilization: {metrics.get('memory_utilization', 0):.4f}")
+
+    print("\n[历史记录]")
+    if generator.history:
+        record = generator.history[-1]
+        print(f"  adjusted: {record.get('adjusted')}")
+        print(f"  adjustment: {record.get('adjustment')}")
 
 if __name__ == '__main__':
-    test_task_graph()
-    print("\n\n")
-    test_resource_aware_generator()
-    print("\n\n")
-    test_Z_R_Z_T()
-    print("\n\n")
-    test_generate_resource_aware_task_graph()
+    # test_task_graph()
+    # print("\n\n")
+    # test_resource_aware_generator()
+    # print("\n\n")
+    # test_Z_R_Z_T()
+    # print("\n\n")
+    # test_generate_resource_aware_task_graph()
+    test_evaluate_with_adjustment()
