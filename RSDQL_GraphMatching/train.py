@@ -203,12 +203,12 @@ def main(use_rainbow=True):
     print(f"RSDQL Graph Matching Training - {model_name}")
     print("=" * 50)
     
-    data = Data('./dataSet/data.xml')
+    data = Data('dataSet/data.xml')
     node_count = len(data.uav_nodes)
     service_count = len(data.service_nodes)
     print(f"Loaded data: {node_count} nodes, {service_count} services")
     
-    env = Env('./dataSet/data.xml')
+    env = Env('dataSet/data.xml')
     print(f"Resource Graph: {env.resource_graph}")
     print(f"Task Graph: {env.task_graph}")
     

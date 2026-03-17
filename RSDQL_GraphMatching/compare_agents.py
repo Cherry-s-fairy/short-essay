@@ -170,12 +170,12 @@ def run_comparison():
     print("        DQN vs Rainbow DQN Comparison Experiment")
     print("=" * 70)
     
-    data = Data('./dataSet/data.xml')
+    data = Data('dataSet/data.xml')
     node_count = len(data.uav_nodes)
     service_count = len(data.service_nodes)
     print(f"\nLoaded data: {node_count} nodes, {service_count} services")
     
-    env = Env('./dataSet/data.xml')
+    env = Env('dataSet/data.xml')
     
     obs_dim = node_count * 3 + service_count * 3 + 1
     act_dim = 10
