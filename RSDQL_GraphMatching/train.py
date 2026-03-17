@@ -205,7 +205,7 @@ def main(use_rainbow=True):
     
     data = Data('dataSet/data.xml')
     node_count = len(data.uav_nodes)
-    service_count = len(data.service_nodes)
+    service_count = len(data.task_nodes)
     print(f"Loaded data: {node_count} nodes, {service_count} services")
     
     env = Env('dataSet/data.xml')

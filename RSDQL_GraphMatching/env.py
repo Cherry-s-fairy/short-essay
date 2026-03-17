@@ -27,6 +27,7 @@ class Env:
     def reset(self):
         self.episode_count += 1
         self.iteration_count = 0
+        self.feedback_optimizer.reset()
         self.matcher = GraphMatcher(self.resource_graph, self.task_graph)
         self.current_mapping = self.matcher.match(method='hungarian')
         
@@ -89,7 +90,7 @@ class Env:
                 self.current_mapping = self.matcher.match(method='hungarian')
                 self.iteration_count += 1
         
-        done = True
+        done = (self.iteration_count >= self.max_iterations) or feedback.get('convergence', False)
         
         info = {
             'match_score': self.matcher.match_score,
@@ -109,18 +110,21 @@ class Env:
         
     def _calculate_cost(self, deployment_plan):
         comm_cost = 0.0
-        
+
         for i, service1 in enumerate(deployment_plan):
             for j, service2 in enumerate(deployment_plan):
                 if i != j:
-                    weight = self.task_graph.get_edge_weight(i, j)
+                    # Use actual 1-based task IDs for edge lookup
+                    sid_i = service1.get('task_id', service1['service_id'])
+                    sid_j = service2.get('task_id', service2['service_id'])
+                    weight = self.task_graph.get_edge_weight(sid_i, sid_j)
                     if weight > 0:
                         node1 = service1['node_id']
                         node2 = service2['node_id']
                         distance = self.resource_graph.get_shortest_path_distance(node1, node2)
                         if distance < float('inf'):
                             comm_cost += weight * distance
-                        
+
         comm_cost = comm_cost / 2.0
         
         var_cost = self._calculate_variance_cost(deployment_plan)
@@ -148,13 +152,21 @@ class Env:
         return cpu_var + mem_var
         
     def _calculate_reward(self, cost):
-        max_cost = 500.0
-        reward = -cost
-        
-        if cost < max_cost:
-            reward += (max_cost - cost) / max_cost * 50
-            
-        return reward
+        n_services = self.task_graph.get_task_count()
+        n_mapped = len(self.current_mapping) if self.current_mapping else 0
+
+        # Primary: reward for deploying ALL services (0–30 points)
+        completeness = n_mapped / max(n_services, 1)
+        completeness_reward = completeness * 30.0
+
+        # Secondary: reward for high match quality (0–20 points)
+        match_reward = self.matcher.match_score * 20.0
+
+        # Penalty: normalized communication + variance cost (0 to −10 points)
+        max_expected_cost = 200.0
+        cost_penalty = -min(cost, max_expected_cost) / max_expected_cost * 10.0
+
+        return completeness_reward + match_reward + cost_penalty
         
     def _simulate_deployment_metrics(self, deployment_plan):
         match_score = self.matcher.match_score
@@ -176,7 +188,9 @@ class Env:
         
         for i in range(len(deployment_plan)):
             for j in range(len(deployment_plan)):
-                weight = self.task_graph.get_edge_weight(i, j)
+                sid_i = deployment_plan[i].get('task_id', deployment_plan[i]['service_id'])
+                sid_j = deployment_plan[j].get('task_id', deployment_plan[j]['service_id'])
+                weight = self.task_graph.get_edge_weight(sid_i, sid_j)
                 if weight > 0:
                     node_i = deployment_plan[i]['node_id']
                     node_j = deployment_plan[j]['node_id']

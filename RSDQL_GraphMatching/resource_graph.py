@@ -85,7 +85,7 @@ class ResourceTopologyGraph:
                             'bandwidth': 0,
                             'latency': float('inf'),
                             'loss': 1,
-                            'weight': float('0')
+                            'weight': float('inf')  # no direct link → unreachable
                         })
                         
     def _build_matrices(self):

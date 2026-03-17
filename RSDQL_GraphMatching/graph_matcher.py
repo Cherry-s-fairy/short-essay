@@ -24,27 +24,48 @@ class GraphMatcher:
         self.match_score = self.calculate_match_score()
         return self.mapping
         
+    def _task_id(self, idx):
+        """Convert a 0-based task list index to the actual task ID used in edges
+        and _task_resources (which are keyed by the 1-based 'id' field)."""
+        if idx < len(self.task_graph.tasks):
+            return self.task_graph.tasks[idx]['id']
+        return idx
+
+    def _is_feasible(self, service_id, node_id):
+        """Return True iff the service's resource demands fit within the node's capacity."""
+        if service_id >= len(self.task_graph.tasks) or node_id >= len(self.resource_graph.nodes):
+            return False
+        service = self.task_graph.tasks[service_id]
+        node = self.resource_graph.nodes[node_id]
+        cpu_cap = node.get('total_cpu', node.get('cpu', 0))
+        mem_cap = node.get('total_memory', node.get('memory', 0))
+        return service['cpu_demand'] <= cpu_cap and service['memory_demand'] <= mem_cap
+
     def _calculate_node_similarity(self, service_id, node_id):
         service_feature = self.task_graph.get_task_feature(service_id)
         node_feature = self.resource_graph.get_node_feature(node_id)
-        
+
         if service_id < len(self.task_graph.tasks):
             service = self.task_graph.tasks[service_id]
             cpu_demand = service['cpu_demand']
             mem_demand = service['memory_demand']
         else:
             return 0.0
-            
+
         if node_id < len(self.resource_graph.nodes):
             node = self.resource_graph.nodes[node_id]
             cpu_capacity = node.get('total_cpu', node.get('cpu', 0))
             mem_capacity = node.get('total_memory', node.get('memory', 0))
         else:
             return 0.0
-            
+
+        # Hard constraint: infeasible assignment gets zero similarity
+        if cpu_demand > cpu_capacity or mem_demand > mem_capacity:
+            return 0.0
+
         cpu_match = 1.0 - abs(cpu_demand - cpu_capacity) / max(cpu_capacity, 1)
         mem_match = 1.0 - abs(mem_demand - mem_capacity) / max(mem_capacity, 1)
-        
+
         similarity = 0.6 * max(0, cpu_match) + 0.4 * max(0, mem_match)
         return similarity
         
@@ -78,142 +99,309 @@ class GraphMatcher:
             return np.zeros((1, 1))
         
         cost_matrix = np.zeros((n_services, n_nodes))
-        
+
         for i in range(n_services):
             for j in range(n_nodes):
-                similarity = self._calculate_node_similarity(i, j)
-                cost_matrix[i][j] = 1.0 - similarity
-                
+                if not self._is_feasible(i, j):
+                    cost_matrix[i][j] = 1e6  # infeasible: never choose this pair
+                else:
+                    similarity = self._calculate_node_similarity(i, j)
+                    cost_matrix[i][j] = 1.0 - similarity
+
         return cost_matrix
         
     def _hungarian_matching(self):
-        cost_matrix = self._build_cost_matrix()
-        
-        n_services = cost_matrix.shape[0]
-        n_nodes = cost_matrix.shape[1]
-        
+        n_services = self.task_graph.get_task_count()
+        n_nodes = self.resource_graph.get_node_count()
+
+        if n_services == 0 or n_nodes == 0:
+            return {}
+
+        base_cost = self._build_cost_matrix()  # [n_services, n_nodes]
+
         if n_services > n_nodes:
-            larger = n_services
-            cost_matrix = np.pad(cost_matrix, ((0, larger - n_services), (0, larger - n_nodes)), mode='constant', constant_values=1000)
-        
+            # Many-to-one: tile each physical node column k times so every service
+            # gets a unique virtual slot while mapping back to a real node.
+            k = (n_services + n_nodes - 1) // n_nodes   # ceil(n_services / n_nodes)
+            cost_matrix = np.tile(base_cost, k)[:, :n_services]  # [n_services, n_services]
+        else:
+            cost_matrix = base_cost
+
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        
+
         mapping = {}
         for i, j in zip(row_ind, col_ind):
-            if i < self.task_graph.get_task_count() and j < self.resource_graph.get_node_count():
-                mapping[i] = j
-            
+            if i < n_services:
+                mapping[i] = j % n_nodes   # virtual column → physical node
+
+        # Validate aggregate node capacity; fall back to capacity-aware greedy if violated
+        if n_services > n_nodes:
+            node_usage = {}
+            overloaded = False
+            for idx, node_id in mapping.items():
+                demand = self.task_graph.get_task_resource_demand(self._task_id(idx))
+                if node_id not in node_usage:
+                    node_usage[node_id] = {'cpu': 0.0, 'memory': 0.0}
+                node_usage[node_id]['cpu'] += demand['cpu']
+                node_usage[node_id]['memory'] += demand['memory']
+            for node_id, usage in node_usage.items():
+                if node_id < len(self.resource_graph.nodes):
+                    node = self.resource_graph.nodes[node_id]
+                    cpu_cap = node.get('total_cpu', node.get('cpu', 0))
+                    mem_cap = node.get('total_memory', node.get('memory', 0))
+                    if usage['cpu'] > cpu_cap or usage['memory'] > mem_cap:
+                        overloaded = True
+                        break
+            if overloaded:
+                return self._learned_matching()
+
         return mapping
         
     def _greedy_matching(self):
+        """Capacity-weighted greedy (one-to-one or many-to-one).
+        Scores each (service, node) pair as similarity * remaining_capacity_fraction
+        so that loaded nodes are penalised and services spread evenly.
+        """
         n_services = self.task_graph.get_task_count()
         n_nodes = self.resource_graph.get_node_count()
-        
-        if n_services > n_nodes:
-            return None
-            
-        similarity_matrix = 1.0 - self._build_cost_matrix()
-        
+
+        # Remaining capacity per node (starts at full)
+        node_remaining = {}
+        node_original = {}
+        for j in range(n_nodes):
+            if j < len(self.resource_graph.nodes):
+                node = self.resource_graph.nodes[j]
+                cpu_cap = node.get('total_cpu', node.get('cpu', 1))
+                mem_cap = node.get('total_memory', node.get('memory', 1))
+                node_remaining[j] = {'cpu': cpu_cap, 'memory': mem_cap}
+                node_original[j] = {'cpu': max(cpu_cap, 1e-9), 'memory': max(mem_cap, 1e-9)}
+
         mapping = {}
         used_nodes = set()
-        
+
         for _ in range(n_services):
-            max_sim = -1
+            best_score = -1.0
             best_service = -1
             best_node = -1
-            
+
             for i in range(n_services):
                 if i in mapping:
                     continue
+                demand = self.task_graph.get_task_resource_demand(self._task_id(i))
                 for j in range(n_nodes):
-                    if j in used_nodes:
+                    if n_services <= n_nodes and j in used_nodes:
                         continue
-                    if similarity_matrix[i][j] > max_sim:
-                        max_sim = similarity_matrix[i][j]
+                    remaining = node_remaining.get(j, {'cpu': 0, 'memory': 0})
+                    if demand['cpu'] > remaining['cpu'] or demand['memory'] > remaining['memory']:
+                        continue
+                    similarity = self._calculate_node_similarity(i, j)
+                    # Scale by fraction of capacity still available (spread load evenly)
+                    cap_frac = (remaining['cpu'] / node_original[j]['cpu'] +
+                                remaining['memory'] / node_original[j]['memory']) / 2.0
+                    score = similarity * cap_frac
+                    if score > best_score:
+                        best_score = score
                         best_service = i
                         best_node = j
-                        
+
             if best_service >= 0 and best_node >= 0:
                 mapping[best_service] = best_node
-                used_nodes.add(best_node)
-                
+                demand = self.task_graph.get_task_resource_demand(self._task_id(best_service))
+                node_remaining[best_node]['cpu'] -= demand['cpu']
+                node_remaining[best_node]['memory'] -= demand['memory']
+                if n_services <= n_nodes:
+                    used_nodes.add(best_node)
+
         return mapping
         
     def _learned_matching(self):
-        return self._hungarian_matching()
-        
-    def _heuristic_matching(self):
+        """Priority-weighted greedy: assigns high-priority services first to their
+        best feasible node, tracking remaining capacity to avoid per-node overload.
+        Falls back to hungarian if not all services can be placed."""
         n_services = self.task_graph.get_task_count()
         n_nodes = self.resource_graph.get_node_count()
-        
-        if n_services > n_nodes:
-            return None
-            
+
+        # Sort services by priority descending so critical ones get first pick
+        service_order = sorted(
+            range(n_services),
+            key=lambda i: (self.task_graph.tasks[i].get('priority', 0)
+                           if i < len(self.task_graph.tasks) else 0),
+            reverse=True
+        )
+
+        # Track remaining capacity per node (used for many-to-one scenarios)
+        node_remaining = {}
+        for j in range(n_nodes):
+            if j < len(self.resource_graph.nodes):
+                node = self.resource_graph.nodes[j]
+                node_remaining[j] = {
+                    'cpu': node.get('total_cpu', node.get('cpu', 0)),
+                    'memory': node.get('total_memory', node.get('memory', 0))
+                }
+
         mapping = {}
-        available_nodes = list(range(n_nodes))
-        
-        for service_id in range(n_services):
-            best_node = -1
-            best_score = -1
-            
-            for node_id in available_nodes:
+        used_nodes = set()
+
+        for service_id in service_order:
+            demand = self.task_graph.get_task_resource_demand(self._task_id(service_id))
+            best_node, best_score = -1, -1.0
+
+            for node_id in range(n_nodes):
+                # One-to-one mode: skip already-used nodes
+                if n_services <= n_nodes and node_id in used_nodes:
+                    continue
+                # Check remaining (not original) capacity
+                remaining = node_remaining.get(node_id, {'cpu': 0, 'memory': 0})
+                if demand['cpu'] > remaining['cpu'] or demand['memory'] > remaining['memory']:
+                    continue
                 score = self._calculate_node_similarity(service_id, node_id)
                 if score > best_score:
                     best_score = score
                     best_node = node_id
-                    
+
             if best_node >= 0:
                 mapping[service_id] = best_node
-                available_nodes.remove(best_node)
-                
-        return mapping
+                node_remaining[best_node]['cpu'] -= demand['cpu']
+                node_remaining[best_node]['memory'] -= demand['memory']
+                if n_services <= n_nodes:
+                    used_nodes.add(best_node)
+
+        # Fall back to hungarian if some services could not be placed
+        return mapping if len(mapping) == n_services else self._hungarian_matching()
+        
+    def _heuristic_matching(self):
+        """Communication-aware greedy (one-to-one or many-to-one).
+        Assigns services in descending order of their total communication weight,
+        choosing the node that minimises expected communication distance to already-placed
+        neighbours — so heavily communicating services end up on nearby nodes.
+        """
+        n_services = self.task_graph.get_task_count()
+        n_nodes = self.resource_graph.get_node_count()
+
+        # Pre-compute total communication weight per service
+        comm_weight = {}
+        for i in range(n_services):
+            task_id = self._task_id(i)
+            total = sum(e['weight'] for e in self.task_graph.edges
+                        if e['src'] == task_id or e['dst'] == task_id)
+            comm_weight[i] = total
+
+        # Sort by descending communication load
+        service_order = sorted(range(n_services), key=lambda i: comm_weight[i], reverse=True)
+
+        # Remaining capacity per node
+        node_remaining = {}
+        for j in range(n_nodes):
+            if j < len(self.resource_graph.nodes):
+                node = self.resource_graph.nodes[j]
+                node_remaining[j] = {
+                    'cpu': node.get('total_cpu', node.get('cpu', 0)),
+                    'memory': node.get('total_memory', node.get('memory', 0))
+                }
+
+        mapping = {}
+        used_nodes = set()
+
+        for service_id in service_order:
+            task_id_s = self._task_id(service_id)
+            demand = self.task_graph.get_task_resource_demand(task_id_s)
+            best_node, best_score = -1, float('inf')
+
+            for node_id in range(n_nodes):
+                if n_services <= n_nodes and node_id in used_nodes:
+                    continue
+                remaining = node_remaining.get(node_id, {'cpu': 0, 'memory': 0})
+                if demand['cpu'] > remaining['cpu'] or demand['memory'] > remaining['memory']:
+                    continue
+                # Communication distance to already-placed neighbours
+                comm_dist = 0.0
+                for placed_idx, placed_node in mapping.items():
+                    edge_w = self.task_graph.get_edge_weight(task_id_s, self._task_id(placed_idx))
+                    if edge_w > 0:
+                        d = self.resource_graph.get_shortest_path_distance(node_id, placed_node)
+                        if d < float('inf'):
+                            comm_dist += edge_w * d
+                # Lower comm_dist is better; break ties with similarity
+                sim = self._calculate_node_similarity(service_id, node_id)
+                score = comm_dist - sim * 0.1   # small bonus for resource fit
+                if score < best_score:
+                    best_score = score
+                    best_node = node_id
+
+            if best_node >= 0:
+                mapping[service_id] = best_node
+                demand = self.task_graph.get_task_resource_demand(task_id_s)
+                node_remaining[best_node]['cpu'] -= demand['cpu']
+                node_remaining[best_node]['memory'] -= demand['memory']
+                if n_services <= n_nodes:
+                    used_nodes.add(best_node)
+
+        return mapping if len(mapping) == n_services else self._hungarian_matching()
         
     def calculate_match_score(self):
         if not self.mapping:
             return 0.0
-            
+
+        n_total = self.task_graph.get_task_count()
+
+        # Deployment completeness: fraction of services actually placed
+        completeness = len(self.mapping) / max(n_total, 1)
+
         node_score = 0.0
         for service_id, node_id in self.mapping.items():
             node_score += self._calculate_node_similarity(service_id, node_id)
         node_score /= len(self.mapping)
-        
+
         service_pairs = []
         service_ids = list(self.mapping.keys())
         for i in range(len(service_ids)):
             for j in range(i + 1, len(service_ids)):
                 service_pairs.append((service_ids[i], service_ids[j]))
-        
+
         edge_score = self._calculate_edge_similarity(
             service_pairs,
             self.mapping
         )
-        
-        self.match_score = 0.7 * node_score + 0.3 * edge_score
+
+        # Weight completeness as the primary gate: partial deployment is penalised
+        self.match_score = completeness * (0.7 * node_score + 0.3 * edge_score)
         return self.match_score
         
     def validate_mapping(self):
         if not self.mapping:
             return False, "No mapping available"
-            
+
         n_services = self.task_graph.get_task_count()
         n_nodes = self.resource_graph.get_node_count()
-        
+
         if len(self.mapping) != n_services:
             return False, f"Mapping incomplete: {len(self.mapping)}/{n_services}"
-            
-        if len(set(self.mapping.values())) != len(self.mapping):
-            return False, "Duplicate node assignment"
-            
+
+        # One-to-one constraint only applies when there are enough nodes;
+        # when n_services > n_nodes, multiple services must share nodes (many-to-one).
+        if n_services <= n_nodes:
+            if len(set(self.mapping.values())) != len(self.mapping):
+                return False, "Duplicate node assignment"
+
+        # Aggregate resource usage per node to detect cumulative overload
+        node_usage = {}
         for service_id, node_id in self.mapping.items():
-            service_demand = self.task_graph.get_task_resource_demand(service_id)
+            demand = self.task_graph.get_task_resource_demand(self._task_id(service_id))
+            if node_id not in node_usage:
+                node_usage[node_id] = {'cpu': 0, 'memory': 0}
+            node_usage[node_id]['cpu'] += demand['cpu']
+            node_usage[node_id]['memory'] += demand['memory']
+
+        for node_id, usage in node_usage.items():
             if node_id < len(self.resource_graph.nodes):
-                node_capacity = self.resource_graph.nodes[node_id]
-                
-                if service_demand['cpu'] > node_capacity.get('total_cpu', node_capacity.get('cpu', 0)):
-                    return False, f"Task {service_id} CPU demand exceeds Node {node_id} capacity"
-                if service_demand['memory'] > node_capacity.get('total_memory', node_capacity.get('memory', 0)):
-                    return False, f"Task {service_id} Memory demand exceeds Node {node_id} capacity"
-                
+                node = self.resource_graph.nodes[node_id]
+                cpu_cap = node.get('total_cpu', node.get('cpu', 0))
+                mem_cap = node.get('total_memory', node.get('memory', 0))
+                if usage['cpu'] > cpu_cap:
+                    return False, f"Node {node_id} CPU overloaded: {usage['cpu']} > {cpu_cap}"
+                if usage['memory'] > mem_cap:
+                    return False, f"Node {node_id} Memory overloaded: {usage['memory']} > {mem_cap}"
+
         return True, "Valid mapping"
         
     def get_mapping(self):
@@ -229,7 +417,8 @@ class GraphMatcher:
             if service_id < len(self.task_graph.tasks):
                 service = self.task_graph.tasks[service_id]
                 deployment_plan.append({
-                    'service_id': service_id,
+                    'service_id': service_id,            # 0-based list index
+                    'task_id': self._task_id(service_id),  # actual task ID (1-based)
                     'node_id': node_id,
                     'cpu_demand': service['cpu_demand'],
                     'memory_demand': service['memory_demand']

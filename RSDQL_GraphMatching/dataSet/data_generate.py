@@ -144,6 +144,6 @@ def create_xml(uav_count=6, uav_edge_count=4, task_count=6, task_edge_count=4):
 
 if __name__ == "__main__":
     random.seed()  # 初始化随机种子
-    tree = create_xml(uav_count=5, uav_edge_count=2, task_count=50, task_edge_count=20)
+    tree = create_xml(uav_count=15, uav_edge_count=25, task_count=50, task_edge_count=15)
     tree.write("data.xml", encoding="utf-8", xml_declaration=True)
     print("XML 文件已生成：data.xml")

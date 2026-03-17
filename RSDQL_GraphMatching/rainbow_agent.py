@@ -79,10 +79,16 @@ class NStepReplayMemory:
         
     def append(self, transition):
         self.n_step_buffer.append(transition)
-        
+
         if len(self.n_step_buffer) >= self.n_step:
             n_transition = self._get_n_step_transition()
             self.buffer.append(n_transition)
+
+        # Clear the short-term buffer at episode end so the next episode
+        # starts fresh and does not mix rewards across episode boundaries.
+        _, _, _, _, done = transition
+        if done:
+            self.n_step_buffer.clear()
             
     def _get_n_step_transition(self):
         reward = 0
@@ -194,18 +200,71 @@ class DuelingDQN:
     def learn(self, states, actions, targets, weights=None):
         if len(states.shape) == 1:
             states = states.reshape(1, -1)
-            
-        current_q = self._forward(states)
-        if len(current_q.shape) == 1:
-            current_q = current_q.reshape(1, -1)
-        
-        td_errors = np.zeros(len(actions))
-        for i, action in enumerate(actions):
-            td_errors[i] = targets[i] - current_q[i][action]
-            
-        if weights is not None:
-            td_errors = td_errors * weights
-            
+        batch_size = states.shape[0]
+
+        if weights is None:
+            weights = np.ones(batch_size)
+
+        # ── Forward pass (use weight_mu directly for stable gradient computation) ──
+        pre_v = states @ self.value_stream.weight_mu + self.value_stream.bias_mu      # [B, H]
+        x_v   = np.maximum(0, pre_v)                                                   # [B, H]
+        V     = x_v @ self.value_head.weight_mu + self.value_head.bias_mu             # [B, 1]
+
+        pre_a = states @ self.advantage_stream.weight_mu + self.advantage_stream.bias_mu  # [B, H]
+        x_a   = np.maximum(0, pre_a)                                                   # [B, H]
+        A     = x_a @ self.advantage_head.weight_mu + self.advantage_head.bias_mu     # [B, n_a]
+
+        Q = V + A - np.mean(A, axis=1, keepdims=True)                                 # [B, n_a]
+
+        # ── TD errors ──
+        Q_sel     = Q[np.arange(batch_size), actions]                                 # [B]
+        td_errors = targets - Q_sel                                                    # [B]
+
+        # ── Backpropagation ──
+        # dL/dQ_sel[k] = -2 * w[k] * td_errors[k]
+        n_a    = A.shape[1]
+        dL_dQ  = -2.0 * weights * td_errors                                           # [B]
+
+        # Dueling: Q[k][j] = V[k] + A[k][j] - mean_l(A[k][l])
+        #   ∂Q[k][a_k]/∂A[k][j] = (1 - 1/n_a) if j==a_k, else (-1/n_a)
+        #   ∂Q[k][a_k]/∂V[k]    = 1
+        delta_A                              = np.full((batch_size, n_a), -1.0 / n_a) # [B, n_a]
+        delta_A[np.arange(batch_size), actions] += 1.0                                # +1 at selected
+        delta_A *= dL_dQ[:, None]                                                      # scale by loss grad
+
+        delta_V = dL_dQ.reshape(-1, 1)                                                # [B, 1]
+
+        # Advantage head: A = x_a @ W_ah + b_ah
+        dW_ah = x_a.T @ delta_A / batch_size                                          # [H, n_a]
+        db_ah = delta_A.mean(axis=0)                                                  # [n_a]
+        dx_a  = delta_A @ self.advantage_head.weight_mu.T                             # [B, H]
+
+        # Value head: V = x_v @ W_vh + b_vh
+        dW_vh = x_v.T @ delta_V / batch_size                                          # [H, 1]
+        db_vh = delta_V.mean(axis=0)                                                  # [1]
+        dx_v  = delta_V @ self.value_head.weight_mu.T                                 # [B, H]
+
+        # Advantage stream ReLU: x_a = max(0, pre_a)
+        dpre_a = dx_a * (pre_a > 0)                                                   # [B, H]
+        dW_a   = states.T @ dpre_a / batch_size                                       # [D, H]
+        db_a   = dpre_a.mean(axis=0)                                                  # [H]
+
+        # Value stream ReLU: x_v = max(0, pre_v)
+        dpre_v = dx_v * (pre_v > 0)                                                   # [B, H]
+        dW_v   = states.T @ dpre_v / batch_size                                       # [D, H]
+        db_v   = dpre_v.mean(axis=0)                                                  # [H]
+
+        # ── Gradient descent on weight_mu parameters ──
+        lr = self.lr
+        self.value_stream.weight_mu     -= lr * dW_v
+        self.value_stream.bias_mu       -= lr * db_v
+        self.advantage_stream.weight_mu -= lr * dW_a
+        self.advantage_stream.bias_mu   -= lr * db_a
+        self.value_head.weight_mu       -= lr * dW_vh
+        self.value_head.bias_mu         -= lr * db_vh
+        self.advantage_head.weight_mu   -= lr * dW_ah
+        self.advantage_head.bias_mu     -= lr * db_ah
+
         return td_errors
 
 
@@ -241,14 +300,16 @@ class RainbowDQNAgent:
         self.epsilon_min = 0.01
         
     def _update_target_net(self):
-        self.target_net.value_stream.weight_mu = self.online_net.value_stream.weight_mu.copy()
-        self.target_net.value_stream.weight_sigma = self.online_net.value_stream.weight_sigma.copy()
-        self.target_net.advantage_stream.weight_mu = self.online_net.advantage_stream.weight_mu.copy()
-        self.target_net.advantage_stream.weight_sigma = self.online_net.advantage_stream.weight_sigma.copy()
-        self.target_net.value_head.weight_mu = self.online_net.value_head.weight_mu.copy()
-        self.target_net.value_head.weight_sigma = self.online_net.value_head.weight_sigma.copy()
-        self.target_net.advantage_head.weight_mu = self.online_net.advantage_head.weight_mu.copy()
-        self.target_net.advantage_head.weight_sigma = self.online_net.advantage_head.weight_sigma.copy()
+        for src, dst in [
+            (self.online_net.value_stream,     self.target_net.value_stream),
+            (self.online_net.advantage_stream, self.target_net.advantage_stream),
+            (self.online_net.value_head,       self.target_net.value_head),
+            (self.online_net.advantage_head,   self.target_net.advantage_head),
+        ]:
+            dst.weight_mu    = src.weight_mu.copy()
+            dst.weight_sigma = src.weight_sigma.copy()
+            dst.bias_mu      = src.bias_mu.copy()
+            dst.bias_sigma   = src.bias_sigma.copy()
         
     def _preprocess_state(self, state):
         if isinstance(state, dict):
@@ -344,24 +405,50 @@ class RainbowDQNAgent:
         return np.mean(np.abs(td_errors)), td_errors
         
     def save_model(self, path):
+        net = self.online_net
         np.savez(path,
-                 value_weight_mu=self.online_net.value_stream.weight_mu,
-                 value_weight_sigma=self.online_net.value_stream.weight_sigma,
-                 advantage_weight_mu=self.online_net.advantage_stream.weight_mu,
-                 advantage_weight_sigma=self.online_net.advantage_stream.weight_sigma,
-                 epsilon=self.epsilon)
-                 
+                 vs_weight_mu=net.value_stream.weight_mu,
+                 vs_weight_sigma=net.value_stream.weight_sigma,
+                 vs_bias_mu=net.value_stream.bias_mu,
+                 vs_bias_sigma=net.value_stream.bias_sigma,
+                 vh_weight_mu=net.value_head.weight_mu,
+                 vh_weight_sigma=net.value_head.weight_sigma,
+                 vh_bias_mu=net.value_head.bias_mu,
+                 vh_bias_sigma=net.value_head.bias_sigma,
+                 as_weight_mu=net.advantage_stream.weight_mu,
+                 as_weight_sigma=net.advantage_stream.weight_sigma,
+                 as_bias_mu=net.advantage_stream.bias_mu,
+                 as_bias_sigma=net.advantage_stream.bias_sigma,
+                 ah_weight_mu=net.advantage_head.weight_mu,
+                 ah_weight_sigma=net.advantage_head.weight_sigma,
+                 ah_bias_mu=net.advantage_head.bias_mu,
+                 ah_bias_sigma=net.advantage_head.bias_sigma,
+                 epsilon=np.array([self.epsilon]))
+
     def load_model(self, path):
         try:
-            data = np.load(path)
-            self.online_net.value_stream.weight_mu = data['value_weight_mu']
-            self.online_net.value_stream.weight_sigma = data['value_weight_sigma']
-            self.online_net.advantage_stream.weight_mu = data['advantage_weight_mu']
-            self.online_net.advantage_stream.weight_sigma = data['advantage_weight_sigma']
-            self.epsilon = data['epsilon']
+            d = np.load(path)
+            net = self.online_net
+            net.value_stream.weight_mu     = d['vs_weight_mu']
+            net.value_stream.weight_sigma  = d['vs_weight_sigma']
+            net.value_stream.bias_mu       = d['vs_bias_mu']
+            net.value_stream.bias_sigma    = d['vs_bias_sigma']
+            net.value_head.weight_mu       = d['vh_weight_mu']
+            net.value_head.weight_sigma    = d['vh_weight_sigma']
+            net.value_head.bias_mu         = d['vh_bias_mu']
+            net.value_head.bias_sigma      = d['vh_bias_sigma']
+            net.advantage_stream.weight_mu    = d['as_weight_mu']
+            net.advantage_stream.weight_sigma = d['as_weight_sigma']
+            net.advantage_stream.bias_mu      = d['as_bias_mu']
+            net.advantage_stream.bias_sigma   = d['as_bias_sigma']
+            net.advantage_head.weight_mu      = d['ah_weight_mu']
+            net.advantage_head.weight_sigma   = d['ah_weight_sigma']
+            net.advantage_head.bias_mu        = d['ah_bias_mu']
+            net.advantage_head.bias_sigma     = d['ah_bias_sigma']
+            self.epsilon = float(d['epsilon'])
             self._update_target_net()
-        except:
-            pass
+        except Exception as e:
+            print(f"[load_model] failed: {e}")
 
 
 def test_rainbow_agent():
